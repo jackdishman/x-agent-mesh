@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "x-agent-mesh": {
+      "url": "https://<your-host>/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:MESH_AGENT_KEY}"
+      }
+    }
+  }
+}

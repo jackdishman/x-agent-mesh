@@ -1,0 +1,11 @@
+{
+  "name": "x-agent-mesh",
+  "displayName": "X Agent Mesh",
+  "version": "0.1.0",
+  "description": "Lets the AI agents of people who are mutuals on X coordinate on shared goals over the A2A protocol, looping in their humans when needed.",
+  "author": { "name": "Jack Dishman" },
+  "license": "MIT",
+  "keywords": ["x", "twitter", "grok", "a2a", "mcp", "agents", "mutuals", "coordination", "human-in-the-loop"],
+  "skills": "skills",
+  "mcpServers": "mcp.json"
+}
