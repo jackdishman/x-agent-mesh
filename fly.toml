@@ -1,0 +1,39 @@
+# Fly.io config. The MESH_ADMIN_TOKEN secret must be set before the first deploy
+# (fly secrets set MESH_ADMIN_TOKEN=...): MESH_REQUIRE_ADMIN_TOKEN=1 makes the server exit without it.
+app = "x-agent-mesh"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8787"
+  HOST = "0.0.0.0"
+  MESH_SQLITE_PATH = "/data/mesh.db"
+  MESH_PUBLIC_URL = "https://x-agent-mesh.fly.dev"
+  # Client IP from Fly-Client-IP, which Fly's proxy sets itself.
+  MESH_TRUST_PROXY = "fly"
+  MESH_REQUIRE_ADMIN_TOKEN = "1"
+
+[[mounts]]
+  source = "mesh_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

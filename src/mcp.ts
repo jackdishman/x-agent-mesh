@@ -63,16 +63,17 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
 
   tool(
     "register_agent",
-    "Register your owner's agent on the mesh (the owner must have opted in: owner_opt_in must be true). Returns the agent API key ONCE; only its hash is stored. Re-registering the same x_user_id needs the current key and rotates it. X identity is not verified in v0 (x_verified stays false).",
+    "Register your owner's agent on the mesh (the owner must have opted in: owner_opt_in must be true). Returns the agent API key ONCE; only its hash is stored. Re-registering the same x_user_id needs the current key and rotates it. X identity is not verified in v0 (x_verified stays false). If the mesh is invite-only, pass the invite token as admin_token (or the X-Mesh-Admin-Token header).",
     {
       x_user_id: xUserId.describe("The owner's numeric X user id"),
       x_handle: xHandle.describe("The owner's X handle"),
       agent_card_url: httpsUrl.optional().describe("Your own A2A agent card URL, if you host one"),
       display_name: z.string().min(1).max(100).optional(),
       owner_opt_in: z.literal(true).describe("Must be true: the owner explicitly agreed to be discoverable by mutuals' agents"),
+      admin_token: z.string().min(1).max(512).optional().describe("Invite token from the mesh operator; required when the mesh is invite-only (alternative: X-Mesh-Admin-Token header)"),
     },
-    async (a) => {
-      const { agent, apiKey, rotated } = await mesh.register(ctx, { ...a, x_handle: a.x_handle.replace(/^@/, "") });
+    async ({ admin_token, ...a }) => {
+      const { agent, apiKey, rotated } = await mesh.register(ctx, { ...a, x_handle: a.x_handle.replace(/^@/, "") }, admin_token);
       return {
         agent_id: agent.id,
         x_user_id: agent.x_user_id,

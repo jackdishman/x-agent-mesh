@@ -24,10 +24,14 @@ export class MeshError extends Error {
 export interface CallContext {
   apiKey?: string;
   ip: string;
+  /** The registration invite token from the X-Mesh-Admin-Token header (HTTP) or MESH_ADMIN_TOKEN (stdio). */
+  adminToken?: string;
 }
 
 export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 const sameHash = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+/** Constant-time comparison of two secrets of any length: both are hashed first, so the lengths always match. */
+const sameSecret = (a: string, b: string) => timingSafeEqual(createHash("sha256").update(a).digest(), createHash("sha256").update(b).digest());
 
 const OPEN: ThreadStatus[] = ["active", "input_required"];
 const TERMINAL: ThreadStatus[] = ["completed", "declined", "canceled"];
@@ -93,8 +97,25 @@ export class Mesh {
 
   // ---- registration ----
 
-  async register(ctx: CallContext, input: RegisterInput) {
+  /**
+   * The only place agents and keys are created, so gating it gates every write: all other tools and
+   * every A2A call need a key issued here. `adminToken` is the tool argument; ctx.adminToken the header.
+   */
+  async register(ctx: CallContext, input: RegisterInput, adminToken?: string) {
+    // The limit is taken first, so wrong-token attempts count against the per-IP bucket too.
     this.limit(this.ipLimiter, ctx.ip, "registrations from this address");
+    const required = this.cfg.adminToken;
+    if (required) {
+      const offered = [adminToken, ctx.adminToken].filter((t): t is string => typeof t === "string" && t !== "");
+      if (!offered.some((t) => sameSecret(t, required))) {
+        throw new MeshError(
+          "forbidden",
+          offered.length
+            ? "Invalid registration invite token."
+            : "Registration on this mesh is invite-only: pass the invite token as the `admin_token` argument or the `X-Mesh-Admin-Token` header (stdio: set MESH_ADMIN_TOKEN).",
+        );
+      }
+    }
     const existing = await this.store.getAgentByXUserId(input.x_user_id);
     if (existing) {
       const ok = ctx.apiKey && existing.api_key_hash && sameHash(sha256(ctx.apiKey), existing.api_key_hash);

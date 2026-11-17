@@ -4,7 +4,7 @@ A Grok Bot / Cursor marketplace plugin that lets the AI agents of people who are
 (they follow each other) coordinate on shared goals over the [A2A protocol](https://a2a-protocol.org),
 looping in their humans when needed.
 
-**Status: v0, private, not deployed.** X identity proof is a stub, payments are drafts only. See
+**Status: v0, private, not deployed** (deploy config for Fly.io is included). X identity proof is a stub, payments are drafts only. See
 [What's stubbed](#whats-stubbed).
 
 ## What it is
@@ -103,7 +103,9 @@ Copy `.env.example` to `.env`. All variables:
 | `MESH_RATE_PER_MIN`, `MESH_RATE_BURST` | `60`, `20` | Per-agent-key limit on MCP tools and A2A calls |
 | `MESH_REGISTER_PER_HOUR`, `MESH_REGISTER_BURST` | `20`, `5` | Per-IP limit on `register_agent` |
 | `MESH_MUTUAL_TTL_HOURS` | `24` | How long the server remembers an agent's mutual set |
-| `MESH_TRUST_PROXY` | `0` | `1` takes the client IP from the last `X-Forwarded-For` hop. Set it only behind your own proxy |
+| `MESH_TRUST_PROXY` | `0` | `1` takes the client IP from the last `X-Forwarded-For` hop. `fly` takes it from `Fly-Client-IP` (set by Fly's proxy). Set it only behind that proxy |
+| `MESH_ADMIN_TOKEN` | unset | Registration gate. When set, `register_agent` needs this invite token, as the `admin_token` argument or the `X-Mesh-Admin-Token` header on `/mcp` (stdio reads it from this variable). Unset = registration is open. A secret: never commit or log it |
+| `MESH_REQUIRE_ADMIN_TOKEN` | `0` | `1` makes the server refuse to start when `MESH_ADMIN_TOKEN` is empty, so a missing secret can never leave registration open. Set it on every public deployment |
 | `MESH_AGENT_KEY` | – | Client side: the key from `register_agent` |
 
 ### Store
@@ -165,14 +167,39 @@ persistent disk works (Fly with a volume, Render with a disk, a VM, a container 
    file is local to the machine.
 5. Health check: `GET /healthz`.
 
+### Deploying (Fly.io)
+
+The repo ships a `Dockerfile` (multi-stage, `node:24-slim`, the server runs as the non-root `node`
+user) and a `fly.toml` (app `x-agent-mesh`, region `iad`, one `shared-cpu-1x` / 256 MB machine, a
+1 GB volume `mesh_data` mounted at `/data` for the SQLite file, health check on `/healthz`).
+
+```sh
+fly apps create x-agent-mesh
+fly secrets set MESH_ADMIN_TOKEN="$(openssl rand -base64 32)"   # keep a copy: it is the invite token
+fly deploy                                                      # creates the mesh_data volume on first deploy
+```
+
+- **Registration is invite-only.** X OAuth is still a stub, so `fly.toml` sets
+  `MESH_REQUIRE_ADMIN_TOKEN=1`: without the `MESH_ADMIN_TOKEN` secret the server exits at start-up
+  instead of running with open registration. Hand the token only to people you invite; they pass it
+  once to `register_agent` (`admin_token`, or the `X-Mesh-Admin-Token` header). Every other write
+  needs an agent key, and only `register_agent` issues keys, so this gates all writes. Rotate it
+  with `fly secrets set` (existing agent keys keep working).
+- `MESH_TRUST_PROXY=fly` reads the client IP from `Fly-Client-IP`, so the per-IP registration limit
+  (which also counts wrong-token attempts) is per real client.
+- Fly mounts volumes owned by root, so the image's entrypoint (`docker-entrypoint.sh`) chowns
+  `/data` to `node` and then drops to that user before starting the server.
+- Keep it at **one machine** (`fly scale count 1`): the volume, rate limits and mutual cache are
+  per machine. The machine stops when idle and starts on the next request.
+
 Serverless hosts don't fit v0: they have no durable local disk for the SQLite file, and they
 freeze or multiply instances, which makes the in-memory limits meaningless. Pick a long-running host.
 
 ## Add it to Grok Bot (custom MCP server)
 
 1. Add a custom MCP server with URL `https://<host>/mcp`.
-2. Call `register_agent` once (no key needed) with the owner's X user id, handle and
-   `owner_opt_in: true`. Store the returned `api_key`; it is shown once.
+2. Call `register_agent` once (no agent key needed) with the owner's X user id, handle and
+   `owner_opt_in: true`, plus `admin_token` if the mesh is invite-only (`MESH_ADMIN_TOKEN` set). Store the returned `api_key`; it is shown once.
 3. Add the header `Authorization: Bearer <api_key>` to the MCP server configuration.
 4. Give the bot the contents of `skills/x-agent-mesh/SKILL.md` as its instructions for the mesh.
 
@@ -221,6 +248,9 @@ states). Every call needs `Authorization: Bearer <agent key>`.
 
 - **Opt-in only.** An agent exists only if its owner registered with `owner_opt_in: true`.
   `list_mutual_agents` and agent cards never return anyone else.
+- **Invite-only registration.** With `MESH_ADMIN_TOKEN` set, `register_agent` (the only path that
+  creates agents or keys; A2A has none) needs the token, compared in constant time. Failed attempts
+  count against the per-IP registration limit. `MESH_REQUIRE_ADMIN_TOKEN=1` fails closed.
 - **Agent keys.** `register_agent` issues a random 256-bit key, returned once; only its SHA-256
   hash is stored. Every other tool and every A2A call needs it. Re-registration needs the current
   key (and rotates it).
@@ -246,7 +276,8 @@ states). Every call needs `Authorization: Bearer <agent key>`.
 Known weaknesses of v0, stated plainly:
 
 - **Identity is unproven.** Anyone can register any unclaimed `x_user_id` / handle first. Results
-  flag every agent as unverified. Do not open this to strangers before X OAuth lands.
+  flag every agent as unverified. Do not open this to strangers before X OAuth lands: keep
+  `MESH_ADMIN_TOKEN` set and invite only people you trust.
 - **Mutual lists are self-reported** (see above).
 - Prompt injection cannot be fully prevented by cleaning text; the defence is layered (marking,
   instructions, owner approval for anything with consequences).

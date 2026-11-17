@@ -34,8 +34,12 @@ function context(mesh: Mesh, req: IncomingMessage): CallContext {
     // The last hop is the one our own proxy appended; earlier ones are the client's claim.
     const xff = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
     ip = xff[xff.length - 1] ?? ip;
+    // On Fly, the proxy sets Fly-Client-IP itself to the address it accepted the connection from.
+    const fly = req.headers["fly-client-ip"];
+    if (mesh.cfg.trustProxy === "fly" && typeof fly === "string" && fly.trim()) ip = fly.trim();
   }
-  return { apiKey: m?.[1], ip };
+  const admin = req.headers["x-mesh-admin-token"];
+  return { apiKey: m?.[1], ip, adminToken: typeof admin === "string" && admin ? admin : undefined };
 }
 
 async function handleMcp(mesh: Mesh, req: IncomingMessage, res: ServerResponse) {
@@ -66,7 +70,7 @@ export function createHttpServer(mesh: Mesh): Server {
       try {
         const path = new URL(req.url ?? "/", "http://mesh.invalid").pathname.replace(/\/+$/, "") || "/";
         if (path === "/healthz" && req.method === "GET") {
-          return json(res, 200, { ok: true, name: "x-agent-mesh", version: VERSION, store: mesh.store.kind, require_verified: mesh.cfg.requireVerified });
+          return json(res, 200, { ok: true, name: "x-agent-mesh", version: VERSION, store: mesh.store.kind, require_verified: mesh.cfg.requireVerified, registration: mesh.cfg.adminToken ? "invite_only" : "open" });
         }
         if (path === "/.well-known/agent-card.json" && req.method === "GET") {
           return json(res, 200, meshAgentCard(mesh), { "Cache-Control": "public, max-age=300" });
