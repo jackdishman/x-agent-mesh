@@ -1,9 +1,10 @@
 // The HTTP server: MCP (Streamable HTTP, stateless) at POST /mcp, A2A JSON-RPC at POST /a2a,
-// agent cards, and /healthz. Plain node:http: five routes don't need a framework.
+// agent cards, Sign in with X (/auth/x/login, /auth/x/callback) and /healthz. Plain node:http: a
+// handful of routes don't need a framework.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { agentCardFor, handleA2A, meshAgentCard } from "./a2a.js";
-import { LIMITS } from "./config.js";
+import { LIMITS, xOAuthConfigured } from "./config.js";
 import { buildMcpServer, VERSION } from "./mcp.js";
 import type { CallContext, Mesh } from "./mesh.js";
 
@@ -70,7 +71,14 @@ export function createHttpServer(mesh: Mesh): Server {
       try {
         const path = new URL(req.url ?? "/", "http://mesh.invalid").pathname.replace(/\/+$/, "") || "/";
         if (path === "/healthz" && req.method === "GET") {
-          return json(res, 200, { ok: true, name: "x-agent-mesh", version: VERSION, store: mesh.store.kind, require_verified: mesh.cfg.requireVerified, registration: mesh.cfg.adminToken ? "invite_only" : "open" });
+          return json(res, 200, { ok: true, name: "x-agent-mesh", version: VERSION, store: mesh.store.kind, require_verified: mesh.cfg.requireVerified, registration: mesh.cfg.adminToken ? "invite_only" : "open", x_oauth: xOAuthConfigured(mesh.cfg) ? "configured" : "disabled" });
+        }
+        if (path === "/auth/x/login" || path === "/auth/x/callback") {
+          if (req.method !== "GET") return json(res, 405, { error: "method_not_allowed", message: "Open this URL in a browser (GET)." }, { Allow: "GET" });
+          const query = new URL(req.url ?? "/", "http://mesh.invalid").searchParams;
+          const out = path === "/auth/x/login" ? mesh.xauth.login(query, context(mesh, req).ip) : await mesh.xauth.callback(query, req.headers.cookie);
+          res.writeHead(out.status, { ...out.headers, "Content-Length": Buffer.byteLength(out.body) });
+          return res.end(out.body);
         }
         if (path === "/.well-known/agent-card.json" && req.method === "GET") {
           return json(res, 200, meshAgentCard(mesh), { "Cache-Control": "public, max-age=300" });

@@ -148,7 +148,7 @@ export class SqliteStore implements Store {
   async updateAgent(xUserId: string, patch: AgentPatch) {
     const sets: string[] = [];
     const params: SQLInputValue[] = [];
-    for (const col of ["x_handle", "agent_card_url", "display_name", "owner_opt_in", "opted_in_at", "api_key_hash"] as const) {
+    for (const col of ["x_handle", "agent_card_url", "display_name", "owner_opt_in", "opted_in_at", "api_key_hash", "x_verified"] as const) {
       const v = patch[col];
       if (v === undefined) continue;
       sets.push(`${col} = ?`);

@@ -1,5 +1,6 @@
 # Fly.io config. The MESH_ADMIN_TOKEN secret must be set before the first deploy
 # (fly secrets set MESH_ADMIN_TOKEN=...): MESH_REQUIRE_ADMIN_TOKEN=1 makes the server exit without it.
+# Sign in with X needs the X_CLIENT_ID and X_CLIENT_SECRET secrets too (fly secrets set, never in this file).
 app = "x-agent-mesh"
 primary_region = "iad"
 
@@ -14,6 +15,9 @@ primary_region = "iad"
   # Client IP from Fly-Client-IP, which Fly's proxy sets itself.
   MESH_TRUST_PROXY = "fly"
   MESH_REQUIRE_ADMIN_TOKEN = "1"
+  # Only agents whose owner proved control of the X account (Sign in with X) are listed or may propose.
+  # Without the X_CLIENT_ID / X_CLIENT_SECRET secrets nobody can verify, so nobody can coordinate.
+  MESH_REQUIRE_VERIFIED = "1"
 
 [[mounts]]
   source = "mesh_data"

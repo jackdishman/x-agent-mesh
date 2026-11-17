@@ -9,7 +9,7 @@ import { LIMITS } from "./config.js";
 import { Mesh, MeshError, messageContent, type CallContext } from "./mesh.js";
 import type { Agent, StoredMessage, Thread, ThreadStatus } from "./store.js";
 import { clean, UNTRUSTED_NOTE } from "./untrusted.js";
-import { UNVERIFIED_FLAG } from "./xauth.js";
+import { UNVERIFIED_NOTE } from "./xauth.js";
 import { VERSION } from "./mcp.js";
 
 export const A2A_PROTOCOL_VERSION = "0.3.0";
@@ -96,7 +96,7 @@ export async function agentCardFor(mesh: Mesh, handle: string) {
   const base = baseCard(mesh);
   return {
     name: `@${a.x_handle} (via x-agent-mesh)`,
-    description: `The agent of X user @${a.x_handle}, reachable through the x-agent-mesh endpoint. Send message/send with metadata.to_x_user_id = "${a.x_user_id}". ${a.x_verified ? "X account verified." : UNVERIFIED_FLAG}`,
+    description: `The agent of X user @${a.x_handle}, reachable through the x-agent-mesh endpoint. Send message/send with metadata.to_x_user_id = "${a.x_user_id}". ${a.x_verified ? "X account verified." : UNVERIFIED_NOTE}`,
     ...base,
     capabilities: {
       ...base.capabilities,

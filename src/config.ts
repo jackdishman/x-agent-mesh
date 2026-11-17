@@ -7,6 +7,19 @@ export interface BucketConfig {
   refillPerSec: number;
 }
 
+/** The X OAuth 2.0 app (a confidential "Web App" client). `clientSecret` is a secret: never log it. */
+export interface XOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  /** Must match a callback URL registered on the X app exactly. */
+  redirectUri: string;
+  /** Space-separated. No offline.access: the mesh discards X tokens and never acts on X. */
+  scopes: string;
+}
+
+/** Sign in with X is on only when both the client id and the client secret are set. */
+export const xOAuthConfigured = (cfg: MeshConfig): boolean => cfg.xOAuth.clientId !== "" && cfg.xOAuth.clientSecret !== "";
+
 export interface MeshConfig {
   /** Public base URL of this server, no trailing slash (used in agent cards). */
   publicUrl: string;
@@ -28,6 +41,8 @@ export interface MeshConfig {
    * or header `X-Mesh-Admin-Token`). Empty = registration is open. A secret: never log it.
    */
   adminToken: string;
+  /** X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI, X_OAUTH_SCOPES. */
+  xOAuth: XOAuthConfig;
 }
 
 export const LIMITS = {
@@ -57,8 +72,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
   if (env.MESH_REQUIRE_ADMIN_TOKEN === "1" && adminToken === "") {
     throw new Error("MESH_REQUIRE_ADMIN_TOKEN=1 but MESH_ADMIN_TOKEN is empty: refusing to start with open registration. Set the MESH_ADMIN_TOKEN secret.");
   }
+  const publicUrl = (env.MESH_PUBLIC_URL || `http://localhost:${port}`).replace(/\/+$/, "");
+  const scopes = (env.X_OAUTH_SCOPES || "users.read tweet.read").trim().split(/\s+/).join(" ");
+  if (scopes.split(" ").includes("offline.access")) {
+    throw new Error("X_OAUTH_SCOPES must not include offline.access: the mesh discards X tokens and never needs a refresh token.");
+  }
   return {
-    publicUrl: (env.MESH_PUBLIC_URL || `http://localhost:${port}`).replace(/\/+$/, ""),
+    publicUrl,
     requireVerified: env.MESH_REQUIRE_VERIFIED === "1",
     agentRate: {
       capacity: num(env, "MESH_RATE_BURST", 20),
@@ -71,6 +91,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
     mutualTtlMs: num(env, "MESH_MUTUAL_TTL_HOURS", 24) * 3_600_000,
     trustProxy: env.MESH_TRUST_PROXY === "fly" ? "fly" : env.MESH_TRUST_PROXY === "1",
     adminToken,
+    xOAuth: {
+      clientId: (env.X_CLIENT_ID ?? "").trim(),
+      clientSecret: (env.X_CLIENT_SECRET ?? "").trim(),
+      redirectUri: (env.X_REDIRECT_URI ?? "").trim() || `${publicUrl}/auth/x/callback`,
+      scopes,
+    },
   };
 }
 
@@ -84,6 +110,7 @@ export function testConfig(over: Partial<MeshConfig> = {}): MeshConfig {
     mutualTtlMs: 24 * 3_600_000,
     trustProxy: false,
     adminToken: "",
+    xOAuth: { clientId: "", clientSecret: "", redirectUri: "https://mesh.test/auth/x/callback", scopes: "users.read tweet.read" },
     ...over,
   };
 }

@@ -48,6 +48,15 @@ describe.each(STORES)("Store behaviour: %s", (_name, make) => {
     expect(await s.getAgentByKeyHash("nope")).toBeNull();
   });
 
+  it("persists x_verified through updateAgent and leaves it alone otherwise", async () => {
+    const s = make();
+    await s.insertAgent(newAgent("1", "alice"));
+    expect((await s.updateAgent("1", { x_verified: true, x_handle: "Alice2" })).x_verified).toBe(true);
+    expect(await s.getAgentByXUserId("1")).toMatchObject({ x_verified: true, x_handle: "Alice2" });
+    expect((await s.updateAgent("1", { display_name: "A" })).x_verified).toBe(true);
+    expect((await s.updateAgent("1", { x_verified: false })).x_verified).toBe(false);
+  });
+
   it("refuses a second agent with the same x_user_id", async () => {
     const s = make();
     await s.insertAgent(newAgent("1", "alice"));

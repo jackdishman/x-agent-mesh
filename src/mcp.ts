@@ -1,17 +1,19 @@
-// The MCP surface: nine tools over a Mesh. One server instance per caller (per HTTP request in
+// The MCP surface: ten tools over a Mesh. One server instance per caller (per HTTP request in
 // stateless Streamable HTTP mode, or per process over stdio); `ctx` carries the caller's key.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { LIMITS } from "./config.js";
+import type { Agent } from "./store.js";
 import { agentView, Mesh, MeshError, messageView, threadView, type CallContext } from "./mesh.js";
 import { clean, SERVER_INSTRUCTIONS, UNTRUSTED_NOTE } from "./untrusted.js";
-import { X_VERIFICATION_TODO } from "./xauth.js";
+import { TICKET_TTL_MS, UNVERIFIED_NOTE } from "./xauth.js";
 
 export const VERSION = "0.1.0";
 
 const READS = new Set(["list_mutual_agents", "list_threads", "read_thread"]);
 const TITLES: Record<string, string> = {
   register_agent: "Register this agent",
+  start_x_verification: "Verify my X account",
   list_mutual_agents: "Mutuals with agents",
   propose_goal: "Propose a shared goal",
   accept_goal: "Accept or decline a goal",
@@ -51,6 +53,17 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
   const server = new McpServer({ name: "x-agent-mesh", version: VERSION }, { instructions: SERVER_INSTRUCTIONS });
   const url = mesh.cfg.publicUrl;
 
+  /** A fresh verify_url for `agent`, or why there is none. Tickets live in the HTTP server's memory, so a stdio process cannot issue them. */
+  function verification(agent: Agent): { verify_url?: string; verify_url_expires_at?: string; verify_note: string } {
+    if (!mesh.xauth.configured) return { verify_note: "Sign in with X is not configured on this mesh (X_CLIENT_ID / X_CLIENT_SECRET are not set), so agents cannot be verified here." };
+    if (ctx.ip === "stdio") return { verify_note: "X verification links are issued by the hosted server: call start_x_verification on its /mcp endpoint with this agent's key." };
+    return {
+      verify_url: mesh.xauth.issueVerifyUrl(agent),
+      verify_url_expires_at: new Date(mesh.now() + TICKET_TTL_MS).toISOString(),
+      verify_note: `Ask your owner to open verify_url in a browser and sign in with X as @${agent.x_handle}. It is a one-time link bound to this agent: share it with nobody else.`,
+    };
+  }
+
   function tool<S extends z.ZodRawShape>(name: string, description: string, shape: S, run: (args: z.infer<z.ZodObject<S>>) => Promise<unknown>) {
     server.registerTool(name, { title: TITLES[name], description, inputSchema: shape, annotations: { title: TITLES[name], ...annotationsOf(name) } }, (async (args: z.infer<z.ZodObject<S>>) => {
       try {
@@ -63,7 +76,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
 
   tool(
     "register_agent",
-    "Register your owner's agent on the mesh (the owner must have opted in: owner_opt_in must be true). Returns the agent API key ONCE; only its hash is stored. Re-registering the same x_user_id needs the current key and rotates it. X identity is not verified in v0 (x_verified stays false). If the mesh is invite-only, pass the invite token as admin_token (or the X-Mesh-Admin-Token header).",
+    "Register your owner's agent on the mesh (the owner must have opted in: owner_opt_in must be true). Returns the agent API key ONCE; only its hash is stored. Re-registering the same x_user_id needs the current key and rotates it. The agent starts unverified: when the result has a verify_url, give it to your owner to open in a browser and sign in with X as the registered account (it expires in 15 minutes; start_x_verification returns a fresh one). If the mesh is invite-only, pass the invite token as admin_token (or the X-Mesh-Admin-Token header).",
     {
       x_user_id: xUserId.describe("The owner's numeric X user id"),
       x_handle: xHandle.describe("The owner's X handle"),
@@ -81,9 +94,27 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
         api_key: apiKey,
         api_key_note: `Shown once and not recoverable: store it as MESH_AGENT_KEY and send it as "Authorization: Bearer <key>".${rotated ? " The previous key no longer works." : ""}`,
         rotated,
-        x_verified: false,
-        x_verified_note: X_VERIFICATION_TODO,
+        x_verified: agent.x_verified,
+        ...(agent.x_verified ? {} : { x_verified_note: UNVERIFIED_NOTE, ...verification(agent) }),
         mesh_agent_card_url: `${url}/agents/${encodeURIComponent(agent.x_handle)}/.well-known/agent-card.json`,
+      };
+    },
+  );
+
+  tool(
+    "start_x_verification",
+    "Returns a fresh verify_url for your owner to open in a browser and sign in with X, proving they control the X account this agent is registered for (sets x_verified). The link is one-time and expires in 15 minutes; a new one replaces any earlier link. Give it only to your owner. The mesh reads the account's id and handle, then discards the X tokens: it never posts or acts on X.",
+    {},
+    async () => {
+      const self = await mesh.auth(ctx);
+      const v = verification(self);
+      if (!v.verify_url) throw new MeshError("invalid", v.verify_note);
+      return {
+        x_user_id: self.x_user_id,
+        x_handle: self.x_handle,
+        x_verified: self.x_verified,
+        ...v,
+        ...(self.x_verified ? { note: "This agent is already verified. Opening the link again only refreshes the handle after a rename on X." } : {}),
       };
     },
   );

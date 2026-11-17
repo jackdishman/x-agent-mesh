@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // HTTP entry: `npm run dev` / `npm start`.
-import { loadConfig } from "./config.js";
+import { loadConfig, xOAuthConfigured } from "./config.js";
 import { createHttpServer } from "./http.js";
 import { Mesh } from "./mesh.js";
 import { createStore } from "./store.js";
@@ -15,7 +15,7 @@ server.listen(port, host, () => {
   console.error(`[x-agent-mesh] listening on http://${host}:${port} (public URL ${cfg.publicUrl})`);
   console.error(`[x-agent-mesh] MCP: POST /mcp · A2A: POST /a2a · card: GET /.well-known/agent-card.json · health: GET /healthz`);
   console.error(`[x-agent-mesh] registration: ${cfg.adminToken ? "invite-only (MESH_ADMIN_TOKEN is set)" : "OPEN (no MESH_ADMIN_TOKEN): do not expose this server publicly"}`);
-  console.error(`[x-agent-mesh] X verification: STUB (x_verified is always false)${cfg.requireVerified ? "; MESH_REQUIRE_VERIFIED=1, so unverified agents are hidden and cannot propose" : ""}`);
+  console.error(`[x-agent-mesh] X OAuth: ${xOAuthConfigured(cfg) ? `configured (callback ${cfg.xOAuth.redirectUri})` : "DISABLED (X_CLIENT_ID / X_CLIENT_SECRET not set): agents cannot be verified"}${cfg.requireVerified ? "; MESH_REQUIRE_VERIFIED=1, so unverified agents are hidden and cannot propose" : ""}`);
 });
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {

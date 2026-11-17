@@ -6,7 +6,7 @@ import { LIMITS, type MeshConfig } from "./config.js";
 import { RateLimiter } from "./ratelimit.js";
 import type { Agent, MessageKind, Store, StoredMessage, Thread, ThreadStatus } from "./store.js";
 import { clean, cleanData } from "./untrusted.js";
-import { UNVERIFIED_FLAG, X_VERIFICATION_TODO } from "./xauth.js";
+import { UNVERIFIED_NOTE, XAuth } from "./xauth.js";
 
 export type MeshErrorCode = "unauthorized" | "forbidden" | "not_found" | "invalid" | "conflict" | "rate_limited";
 
@@ -61,15 +61,18 @@ export class Mesh {
   private authFailLimiter: RateLimiter;
   /** The mutual set each agent last supplied (x_user_id → ids), kept for cfg.mutualTtlMs. In memory: lost on restart. */
   private mutuals = new Map<string, { ids: Set<string>; at: number }>();
+  /** Sign in with X: verification tickets and the OAuth flow behind /auth/x/*. */
+  readonly xauth: XAuth;
 
   constructor(
     public store: Store,
     public cfg: MeshConfig,
-    private now: () => number = Date.now,
+    readonly now: () => number = Date.now,
   ) {
     this.agentLimiter = new RateLimiter(cfg.agentRate, now);
     this.ipLimiter = new RateLimiter(cfg.ipRate, now);
     this.authFailLimiter = new RateLimiter({ capacity: 30, refillPerSec: 0.5 }, now);
+    this.xauth = new XAuth(store, cfg, now);
   }
 
   // ---- auth and limits ----
@@ -135,6 +138,9 @@ export class Mesh {
       owner_opt_in: true,
       opted_in_at: existing?.opted_in_at ?? new Date(this.now()).toISOString(),
       api_key_hash: sha256(apiKey),
+      // Verification proved the X account's id and its handle at that time. A key holder renaming
+      // the agent afterwards has proven nothing about the new handle: verify again.
+      ...(existing?.x_verified && existing.x_handle.toLowerCase() !== input.x_handle.toLowerCase() ? { x_verified: false } : {}),
     };
     const agent = existing ? await this.store.updateAgent(existing.x_user_id, fields) : await this.store.insertAgent({ x_user_id: input.x_user_id, ...fields });
     return { agent, apiKey, rotated: Boolean(existing) };
@@ -192,7 +198,7 @@ export class Mesh {
   async propose(self: Agent, goal: string, participantIds: string[], lists?: { followerIds: string[]; followingIds: string[] }): Promise<Thread> {
     if (!self.owner_opt_in) throw new MeshError("forbidden", "Your owner has not opted in.");
     if (this.cfg.requireVerified && !self.x_verified) {
-      throw new MeshError("forbidden", `This mesh requires X-verified agents (MESH_REQUIRE_VERIFIED=1) and yours is not verified. ${X_VERIFICATION_TODO}`);
+      throw new MeshError("forbidden", `This mesh requires X-verified agents (MESH_REQUIRE_VERIFIED=1) and yours is not verified. Call start_x_verification and have your owner open the returned verify_url to sign in with X as @${self.x_handle}.`);
     }
     const others = [...new Set(participantIds)].filter((id) => id !== self.x_user_id);
     if (others.length === 0) throw new MeshError("invalid", "Name at least one participant other than yourself.");
@@ -353,7 +359,7 @@ export function agentView(a: Agent, publicUrl: string) {
     untrusted_agent_card_url: a.agent_card_url === null ? null : clean(a.agent_card_url, 500),
     mesh_agent_card_url: `${publicUrl}/agents/${encodeURIComponent(a.x_handle)}/.well-known/agent-card.json`,
     x_verified: a.x_verified,
-    ...(a.x_verified ? {} : { verification: UNVERIFIED_FLAG }),
+    ...(a.x_verified ? {} : { verification: UNVERIFIED_NOTE }),
   };
 }
 

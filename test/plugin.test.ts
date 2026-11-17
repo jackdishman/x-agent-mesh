@@ -50,13 +50,25 @@ describe("plugin files", () => {
   });
 
   it("no source file can move money or post to X", () => {
-    // The server has no payment or X client: it imports only the MCP SDK, supabase-js, zod and node builtins, and never calls fetch.
+    // The server has no payment client and no X write path: it imports only the MCP SDK, supabase-js, zod and node
+    // builtins, and only xauth.ts calls fetch, to exactly two X endpoints (token exchange and "who am I").
     const dir = join(root, "src");
     for (const f of readdirSync(dir)) {
       const src = readFileSync(join(dir, f), "utf8");
       const imports = [...src.matchAll(/from "([^"]+)"/g)].map((m) => m[1]!);
       for (const i of imports) expect(i, `${f} imports ${i}`).toMatch(/^(\.\/|node:|@modelcontextprotocol\/sdk\/|@supabase\/supabase-js$|zod$)/);
-      expect(src, f).not.toMatch(/\bfetch\(/);
+      if (f !== "xauth.ts") expect(src, f).not.toMatch(/\bfetch\(/);
     }
+    const xauth = readFileSync(join(dir, "xauth.ts"), "utf8");
+    expect([...xauth.matchAll(/\bfetch\((\w+)/g)].map((m) => m[1])).toEqual(["X_TOKEN_URL", "X_ME_URL"]);
+    expect([...xauth.matchAll(/"(https?:\/\/[^"]+)"/g)].map((m) => m[1])).toEqual(["https://x.com/i/oauth2/authorize", "https://api.x.com/2/oauth2/token", "https://api.x.com/2/users/me"]);
+    expect(xauth).not.toMatch(/offline\.access"|refresh_token/);
+  });
+
+  it("the skill and README list start_x_verification, and fly.toml requires verified agents", () => {
+    expect(read("skills/x-agent-mesh/SKILL.md")).toContain("start_x_verification");
+    expect(read("README.md")).toContain("start_x_verification");
+    expect(read("fly.toml")).toMatch(/^\s*MESH_REQUIRE_VERIFIED = "1"$/m);
+    expect(read("fly.toml")).not.toMatch(/X_CLIENT_SECRET\s*=/); // secrets go in `fly secrets`, not the file
   });
 });

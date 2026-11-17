@@ -11,7 +11,9 @@ describe("register_agent and key auth", () => {
     expect(r.isError).toBe(false);
     expect(r.body.api_key).toMatch(/^xam_[A-Za-z0-9_-]{43}$/);
     expect(r.body.x_verified).toBe(false);
-    expect(r.body.x_verified_note).toContain("TODO(x-oauth)");
+    expect(r.body.x_verified_note).toContain("has not yet proven control of this X account via Sign in with X");
+    expect(r.body.verify_url).toBeUndefined(); // X OAuth is not configured in this mesh
+    expect(r.body.verify_note).toContain("not configured");
     expect(r.body.x_handle).toBe("alice");
     const row = await mesh.store.getAgentByXUserId("1");
     expect(row?.api_key_hash).toBe(sha256(r.body.api_key));
@@ -108,6 +110,7 @@ describe("list_mutual_agents", () => {
     const p = await call(mesh, alice.ctx, "propose_goal", { goal: "g", participant_x_user_ids: ["2"] });
     expect(p.body.error).toBe("forbidden");
     expect(p.body.message).toContain("verified");
+    expect(p.body.message).toContain("start_x_verification");
   });
 });
 
@@ -328,12 +331,12 @@ describe("rate limits", () => {
 });
 
 describe("tool surface", () => {
-  it("lists the nine tools with the right annotations and safety instructions", async () => {
+  it("lists the ten tools with the right annotations and safety instructions", async () => {
     const mesh = newMesh();
     const c = await client(mesh, { ip: "a" });
     const { tools } = await c.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ["accept_goal", "escalate_to_human", "list_mutual_agents", "list_threads", "post_update", "propose_goal", "propose_payment", "read_thread", "register_agent"],
+      ["accept_goal", "escalate_to_human", "list_mutual_agents", "list_threads", "post_update", "propose_goal", "propose_payment", "read_thread", "register_agent", "start_x_verification"],
     );
     for (const t of tools) {
       const reads = ["list_mutual_agents", "list_threads", "read_thread"].includes(t.name);

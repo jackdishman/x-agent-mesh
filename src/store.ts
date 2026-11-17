@@ -47,7 +47,8 @@ export interface StoredMessage {
 }
 
 export type NewAgent = Pick<Agent, "x_user_id" | "x_handle" | "agent_card_url" | "display_name" | "owner_opt_in" | "opted_in_at" | "api_key_hash">;
-export type AgentPatch = Partial<Pick<Agent, "x_handle" | "agent_card_url" | "display_name" | "owner_opt_in" | "opted_in_at" | "api_key_hash">>;
+/** `x_verified` is set only by the X OAuth callback (src/xauth.ts) and cleared when a verified agent changes its handle. */
+export type AgentPatch = Partial<Pick<Agent, "x_handle" | "agent_card_url" | "display_name" | "owner_opt_in" | "opted_in_at" | "api_key_hash" | "x_verified">>;
 export type NewThread = Pick<Thread, "goal" | "proposer_x_user_id" | "participants" | "accepted_by" | "status">;
 export type ThreadPatch = Partial<Pick<Thread, "accepted_by" | "status">>;
 export type NewMessage = Pick<StoredMessage, "thread_id" | "from_x_user_id" | "kind" | "message" | "needs_human"> & { id?: string };
