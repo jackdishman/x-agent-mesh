@@ -84,9 +84,10 @@ describe("SupabaseStore (mocked client)", () => {
 });
 
 describe("createStore", () => {
-  it("defaults to MemoryStore without Supabase env, SupabaseStore with it", () => {
-    expect(createStore({})).toBeInstanceOf(MemoryStore);
-    expect(createStore({ SUPABASE_URL: "https://example.supabase.co" })).toBeInstanceOf(MemoryStore);
+  it("picks Supabase when both variables are set, memory on MESH_STORE=memory", () => {
+    expect(createStore({ MESH_STORE: "memory" })).toBeInstanceOf(MemoryStore);
+    expect(createStore({ SUPABASE_URL: "https://example.supabase.co", MESH_STORE: "memory" })).toBeInstanceOf(MemoryStore);
     expect(createStore({ SUPABASE_URL: "https://example.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "k" })).toBeInstanceOf(SupabaseStore);
+    expect(createStore({ SUPABASE_URL: "https://example.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "k", MESH_STORE: "memory" })).toBeInstanceOf(SupabaseStore);
   });
 });

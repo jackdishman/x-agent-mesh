@@ -1,5 +1,9 @@
--- x-agent-mesh v0. These tables ALREADY EXIST in the project's Supabase database (public schema,
--- RLS on, service-role only); this file records the exact DDL. Do not re-run against that database.
+-- x-agent-mesh v0: Postgres DDL for the OPTIONAL Supabase store.
+-- NOT APPLIED ANYWHERE: no Supabase project holds these tables today (an earlier copy in another
+-- app's project was dropped). The default store is SQLite (src/sqlite-store.ts creates its own
+-- schema), so this file is only needed if the mesh later gets a Supabase project of its own:
+-- apply it there (public schema, RLS on, service-role only), never to another app's project.
+-- If you do, also add:  create index mesh_agents_api_key_hash_idx on public.mesh_agents (api_key_hash);
 create table public.mesh_agents (
   id uuid primary key default gen_random_uuid(),
   x_user_id text not null unique, x_handle text not null, agent_card_url text, display_name text,

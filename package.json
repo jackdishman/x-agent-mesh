@@ -6,7 +6,7 @@
   "type": "module",
   "license": "MIT",
   "author": "Jack Dishman",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22.5" },
   "bin": { "x-agent-mesh-stdio": "dist/stdio.js" },
   "scripts": {
     "build": "tsc",

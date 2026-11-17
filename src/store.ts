@@ -1,7 +1,11 @@
-// Persistence. `SupabaseStore` talks to the three mesh_* tables (public schema, RLS on,
-// service-role only; DDL in supabase/migrations). `MemoryStore` is for tests and local dev.
+// Persistence. `SqliteStore` (./sqlite-store.ts, a local file) is the default. `SupabaseStore` is
+// optional: it talks to the three mesh_* tables of a Supabase project (public schema, RLS on,
+// service-role only; DDL in supabase/migrations). `MemoryStore` is for tests and throwaway runs.
 import { randomUUID } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { SqliteStore } from "./sqlite-store.js";
+
+export { SqliteStore };
 
 export type ThreadStatus = "proposed" | "active" | "input_required" | "completed" | "declined" | "canceled";
 export type MessageKind = "proposal" | "accept" | "decline" | "update" | "escalation" | "payment_draft" | "status";
@@ -49,7 +53,7 @@ export type ThreadPatch = Partial<Pick<Thread, "accepted_by" | "status">>;
 export type NewMessage = Pick<StoredMessage, "thread_id" | "from_x_user_id" | "kind" | "message" | "needs_human"> & { id?: string };
 
 export interface Store {
-  readonly kind: "supabase" | "memory";
+  readonly kind: "supabase" | "sqlite" | "memory";
   getAgentByXUserId(xUserId: string): Promise<Agent | null>;
   /** Case-insensitive. */
   getAgentByHandle(handle: string): Promise<Agent | null>;
@@ -247,7 +251,14 @@ function must<T>(r: DbResult): T {
   return v;
 }
 
-/** SupabaseStore when SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set, MemoryStore otherwise. Logs which (to stderr: stdout belongs to the stdio transport). */
+export const DEFAULT_SQLITE_PATH = "./data/mesh.db";
+
+/**
+ * Picks the store from the environment, and logs which (to stderr: stdout belongs to the stdio transport):
+ * 1. SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY both set: SupabaseStore.
+ * 2. MESH_STORE=memory: MemoryStore (lost on restart).
+ * 3. Otherwise: SqliteStore at MESH_SQLITE_PATH (default ./data/mesh.db; the directory is created).
+ */
 export function createStore(env: NodeJS.ProcessEnv = process.env): Store {
   const url = env.SUPABASE_URL;
   const key = env.SUPABASE_SERVICE_ROLE_KEY;
@@ -255,6 +266,12 @@ export function createStore(env: NodeJS.ProcessEnv = process.env): Store {
     console.error(`[x-agent-mesh] store: Supabase (${new URL(url).host})`);
     return new SupabaseStore(createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } }));
   }
-  console.error("[x-agent-mesh] store: in-memory (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set). Data is lost on restart.");
-  return new MemoryStore();
+  if (url || key) console.error("[x-agent-mesh] only one of SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY is set: ignoring it.");
+  if (env.MESH_STORE?.trim().toLowerCase() === "memory") {
+    console.error("[x-agent-mesh] store: in-memory (MESH_STORE=memory). Data is lost on restart.");
+    return new MemoryStore();
+  }
+  const store = new SqliteStore(env.MESH_SQLITE_PATH?.trim() || DEFAULT_SQLITE_PATH);
+  console.error(`[x-agent-mesh] store: SQLite (${store.path})`);
+  return store;
 }

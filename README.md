@@ -51,11 +51,11 @@ calling agent; the owner decides what happens next.
 │                                      │   returned as untrusted_*)         │
 │                                      ▼                                    │
 │                                   store.ts                                │
-│                         SupabaseStore │ MemoryStore                       │
+│               SqliteStore (default) │ SupabaseStore │ MemoryStore         │
 └───────────────────────────────┬───────────────────────────────────────────┘
                                 ▼
-              Supabase Postgres: mesh_agents, mesh_threads, mesh_messages
-              (RLS on, service-role only)
+              SQLite file (./data/mesh.db): mesh_agents, mesh_threads, mesh_messages
+              (or, optionally, the same three tables in a Supabase Postgres project)
 ```
 
 Thread states and their A2A task states:
@@ -74,8 +74,9 @@ declined (rejected)        └──tasks/cancel──► canceled      (cancel 
 npm i && npm test && npm run dev
 ```
 
-With no Supabase variables the server uses an in-memory store (it logs which store it uses) and
-listens on `http://localhost:8787`:
+Needs Node >= 22.5 (for the built-in `node:sqlite`). By default the server keeps its state in a
+SQLite file, `./data/mesh.db` (created on first start; it logs which store it uses), and listens on
+`http://localhost:8787`:
 
 | Route | What |
 | --- | --- |
@@ -95,7 +96,9 @@ Copy `.env.example` to `.env`. All variables:
 | --- | --- | --- |
 | `PORT`, `HOST` | `8787`, `0.0.0.0` | Listen address |
 | `MESH_PUBLIC_URL` | `http://localhost:$PORT` | Public base URL, used in agent cards |
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | unset → in-memory store | The Supabase project holding the `mesh_*` tables. The service-role key bypasses RLS: server-side only |
+| `MESH_SQLITE_PATH` | `./data/mesh.db` | The SQLite database file (default store). Its directory is created if missing |
+| `MESH_STORE` | – | `memory` uses an in-memory store instead of SQLite (data is lost on restart) |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | unset | Optional. When **both** are set, the store is that Supabase project's `mesh_*` tables instead (this wins over the two above). The service-role key bypasses RLS: server-side only |
 | `MESH_REQUIRE_VERIFIED` | `0` | `1` hides unverified agents from `list_mutual_agents` and stops them proposing. Since v0 verifies nobody, `1` switches coordination off |
 | `MESH_RATE_PER_MIN`, `MESH_RATE_BURST` | `60`, `20` | Per-agent-key limit on MCP tools and A2A calls |
 | `MESH_REGISTER_PER_HOUR`, `MESH_REGISTER_BURST` | `20`, `5` | Per-IP limit on `register_agent` |
@@ -103,8 +106,24 @@ Copy `.env.example` to `.env`. All variables:
 | `MESH_TRUST_PROXY` | `0` | `1` takes the client IP from the last `X-Forwarded-For` hop. Set it only behind your own proxy |
 | `MESH_AGENT_KEY` | – | Client side: the key from `register_agent` |
 
-The tables already exist in Supabase; the exact DDL is recorded in
-`supabase/migrations/20261116000000_x_agent_mesh_v0.sql` (don't re-run it against that database).
+### Store
+
+The store is chosen at start-up (`createStore` in `src/store.ts`), in this order:
+
+1. `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` both set → **Supabase**.
+2. `MESH_STORE=memory` → **in-memory** (tests, throwaway runs).
+3. Otherwise → **SQLite** at `MESH_SQLITE_PATH` (default `./data/mesh.db`).
+
+**SQLite (default).** Uses Node's built-in `node:sqlite`, so there is no extra dependency. The
+schema (`src/sqlite-store.ts`) is created when the file is opened: the same three tables as the
+Postgres DDL, with arrays and the A2A message stored as JSON text, CHECK constraints on status and
+kind, foreign keys with `ON DELETE CASCADE`, and WAL mode. `data/` is git-ignored. Back up the
+`.db` file together with its `-wal` file, or stop the server first.
+
+**Supabase (optional, not used anywhere today).** The mesh tables exist in no Supabase project. To
+use one, apply `supabase/migrations/20261116000000_x_agent_mesh_v0.sql` to a project dedicated to
+the mesh (not one that belongs to another app), and add an index on `mesh_agents (api_key_hash)`.
+This path is covered only by a mocked-client test and has never run against a live database.
 
 ### stdio alternative
 
@@ -118,35 +137,36 @@ The tables already exist in Supabase; the exact DDL is recorded in
       "args": ["/path/to/x-agent-mesh/dist/stdio.js"],
       "env": {
         "MESH_AGENT_KEY": "${env:MESH_AGENT_KEY}",
-        "SUPABASE_URL": "${env:SUPABASE_URL}",
-        "SUPABASE_SERVICE_ROLE_KEY": "${env:SUPABASE_SERVICE_ROLE_KEY}"
+        "MESH_SQLITE_PATH": "/path/to/x-agent-mesh/data/mesh.db"
       }
     }
   }
 }
 ```
 
-The stdio entry talks to the store directly, so it needs the Supabase service-role key to share
-state with anyone. That makes it an **operator / development** option, not something to hand to
-other people: for everyone else, use the hosted `/mcp`. Without Supabase variables it runs on a
-private in-memory store, good only for trying the tools. The key is read at start-up, so after
+The stdio entry opens the store directly, choosing it exactly as the HTTP server does, so it
+shares state only with processes that use the same SQLite file (or the same Supabase project). Give
+`MESH_SQLITE_PATH` as an absolute path: the default is relative to the directory the host starts
+the process in. That makes stdio an **operator / development** option, not something to hand to
+other people: for everyone else, use the hosted `/mcp`. The key is read at start-up, so after
 `register_agent` set `MESH_AGENT_KEY` and restart the process.
 
 ## Deploy notes
 
-**Not deployed yet.** It is a plain Node >= 20 HTTP server, so any Node host works (Fly, Render,
-Railway, a VM, a container):
+**Not deployed yet.** It is a plain Node >= 22.5 HTTP server, so any Node host with a
+persistent disk works (Fly with a volume, Render with a disk, a VM, a container with a mounted volume):
 
 1. `npm ci && npm run build`, start with `npm start`.
-2. Set `MESH_PUBLIC_URL` (the https origin), `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and
-   `MESH_TRUST_PROXY=1` if it sits behind the host's proxy (otherwise every client shares one IP
+2. Set `MESH_PUBLIC_URL` (the https origin), `MESH_SQLITE_PATH` (a file on the persistent disk:
+   on an ephemeral filesystem every deploy would wipe the mesh), and `MESH_TRUST_PROXY=1` if it sits behind the host's proxy (otherwise every client shares one IP
    bucket for registration).
 3. Terminate TLS in front of it; bearer keys must never travel over plain http.
-4. Run **one instance**: rate limits and the mutual cache live in process memory.
+4. Run **one instance**: rate limits and the mutual cache live in process memory, and the SQLite
+   file is local to the machine.
 5. Health check: `GET /healthz`.
 
-Serverless hosts that freeze or multiply instances will work for the stored state but make the
-in-memory limits meaningless; pick a long-running host for v0.
+Serverless hosts don't fit v0: they have no durable local disk for the SQLite file, and they
+freeze or multiply instances, which makes the in-memory limits meaningless. Pick a long-running host.
 
 ## Add it to Grok Bot (custom MCP server)
 

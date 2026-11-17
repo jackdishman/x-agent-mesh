@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // stdio MCP entry, for running the mesh tools as a local process instead of the hosted /mcp.
-// It talks to the store directly, so it needs SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY to share
-// state with anyone (without them it uses a private in-memory store: useful only for trying the
-// tools). The caller's agent key comes from MESH_AGENT_KEY. stdout is the protocol: logs go to stderr.
+// It opens the store directly, with the same selection as the HTTP server (createStore: Supabase
+// if configured, MESH_STORE=memory, else the SQLite file at MESH_SQLITE_PATH), so it shares state
+// only with processes using that same store. The caller's agent key comes from MESH_AGENT_KEY.
+// stdout is the protocol: logs go to stderr.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { buildMcpServer } from "./mcp.js";
