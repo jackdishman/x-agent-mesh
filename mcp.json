@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "x-agent-mesh": {
-      "url": "https://<your-host>/mcp",
+      "url": "https://x-agent-mesh.fly.dev/mcp",
       "headers": {
         "Authorization": "Bearer ${env:MESH_AGENT_KEY}"
       }
