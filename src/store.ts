@@ -4,8 +4,10 @@
 import { randomUUID } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { SqliteStore } from "./sqlite-store.js";
+import { handleTaken, xUserIdTaken } from "./store-shared.js";
 
 export { SqliteStore };
+export { StoreError, type StoreErrorCode } from "./store-shared.js";
 
 export type ThreadStatus = "proposed" | "active" | "input_required" | "completed" | "declined" | "canceled";
 export type MessageKind = "proposal" | "accept" | "decline" | "update" | "escalation" | "payment_draft" | "status";
@@ -61,7 +63,12 @@ export interface Store {
   getAgentByKeyHash(hash: string): Promise<Agent | null>;
   /** The opted-in agents among `xUserIds` (never a non-opted-in one). */
   getOptedInAgents(xUserIds: string[]): Promise<Agent[]>;
+  /**
+   * Check and write are one step: of two concurrent calls for one handle (any case) or one
+   * x_user_id, exactly one succeeds and the other gets a StoreError (`handle_taken` / `x_user_id_taken`).
+   */
   insertAgent(a: NewAgent): Promise<Agent>;
+  /** A patch that sets `x_handle` to one another agent holds (any case) gets StoreError `handle_taken`. */
   updateAgent(xUserId: string, patch: AgentPatch): Promise<Agent>;
   insertThread(t: NewThread): Promise<Thread>;
   getThread(id: string): Promise<Thread | null>;
@@ -113,7 +120,8 @@ export class MemoryStore implements Store {
     return out;
   }
   async insertAgent(a: NewAgent) {
-    if (this.agents.has(a.x_user_id)) throw new Error("duplicate key value violates unique constraint (x_user_id)");
+    if (this.agents.has(a.x_user_id)) throw xUserIdTaken();
+    this.checkHandleFree(a.x_handle, a.x_user_id);
     const at = this.stamp();
     const row: Agent = { id: randomUUID(), x_verified: false, created_at: at, updated_at: at, ...a };
     this.agents.set(row.x_user_id, row);
@@ -122,8 +130,14 @@ export class MemoryStore implements Store {
   async updateAgent(xUserId: string, patch: AgentPatch) {
     const row = this.agents.get(xUserId);
     if (!row) throw new Error("agent not found");
+    if (patch.x_handle !== undefined) this.checkHandleFree(patch.x_handle, xUserId);
     Object.assign(row, patch, { updated_at: this.stamp() });
     return clone(row);
+  }
+  /** No await between this check and the write that follows it, so nothing can interleave. */
+  private checkHandleFree(handle: string, xUserId: string): void {
+    const h = handle.toLowerCase();
+    for (const a of this.agents.values()) if (a.x_user_id !== xUserId && a.x_handle.toLowerCase() === h) throw handleTaken();
   }
   async insertThread(t: NewThread) {
     const at = this.stamp();
@@ -234,11 +248,20 @@ export class SupabaseStore implements Store {
 
 interface DbResult {
   data: unknown;
-  error: { message: string } | null;
+  error: { message: string; code?: string; details?: string } | null;
 }
-/** Database errors are logged for the operator; callers only learn that the store failed. */
+/**
+ * Database errors are logged for the operator; callers only learn that the store failed. The one
+ * exception is a unique violation on mesh_agents (Postgres 23505): the race-safe answer to two
+ * registrations of one handle or one x_user_id.
+ */
 function check(r: DbResult): unknown {
   if (r.error) {
+    if (r.error.code === "23505") {
+      const what = `${r.error.message} ${r.error.details ?? ""}`;
+      if (/handle/i.test(what)) throw handleTaken();
+      if (/x_user_id/i.test(what)) throw xUserIdTaken();
+    }
     console.error(`[x-agent-mesh] supabase error: ${r.error.message}`);
     throw new Error("The mesh database is unavailable or rejected the request.");
   }

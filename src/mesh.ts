@@ -4,7 +4,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { LIMITS, type MeshConfig } from "./config.js";
 import { RateLimiter } from "./ratelimit.js";
-import type { Agent, MessageKind, Store, StoredMessage, Thread, ThreadStatus } from "./store.js";
+import { StoreError, type Agent, type MessageKind, type Store, type StoredMessage, type Thread, type ThreadStatus } from "./store.js";
 import { clean, cleanData } from "./untrusted.js";
 import { UNVERIFIED_NOTE, XAuth } from "./xauth.js";
 
@@ -137,17 +137,15 @@ export class Mesh {
         );
       }
     }
+    const idTaken = () => new MeshError("forbidden", "This x_user_id is already registered. Re-registering (which rotates the key) requires the agent's current API key as the bearer token / MESH_AGENT_KEY.");
+    const handleTaken = () => new MeshError("conflict", "This x_handle is already registered to a different x_user_id.");
     const existing = await this.store.getAgentByXUserId(input.x_user_id);
     if (existing) {
       const ok = ctx.apiKey && existing.api_key_hash && sameHash(sha256(ctx.apiKey), existing.api_key_hash);
-      if (!ok) {
-        throw new MeshError("forbidden", "This x_user_id is already registered. Re-registering (which rotates the key) requires the agent's current API key as the bearer token / MESH_AGENT_KEY.");
-      }
+      if (!ok) throw idTaken();
     }
     const holder = await this.store.getAgentByHandle(input.x_handle);
-    if (holder && holder.x_user_id !== input.x_user_id) {
-      throw new MeshError("conflict", "This x_handle is already registered to a different x_user_id.");
-    }
+    if (holder && holder.x_user_id !== input.x_user_id) throw handleTaken();
     const apiKey = `xam_${randomBytes(32).toString("base64url")}`;
     const fields = {
       x_handle: input.x_handle,
@@ -160,7 +158,16 @@ export class Mesh {
       // the agent afterwards has proven nothing about the new handle: verify again.
       ...(existing?.x_verified && existing.x_handle.toLowerCase() !== input.x_handle.toLowerCase() ? { x_verified: false } : {}),
     };
-    const agent = existing ? await this.store.updateAgent(existing.x_user_id, fields) : await this.store.insertAgent({ x_user_id: input.x_user_id, ...fields });
+    // The checks above give the usual answers. The store repeats them atomically with the write,
+    // so two registrations racing for one handle (or one x_user_id) cannot both succeed.
+    let agent: Agent;
+    try {
+      agent = existing ? await this.store.updateAgent(existing.x_user_id, fields) : await this.store.insertAgent({ x_user_id: input.x_user_id, ...fields });
+    } catch (e) {
+      if (e instanceof StoreError && e.code === "handle_taken") throw handleTaken();
+      if (e instanceof StoreError && e.code === "x_user_id_taken") throw idTaken();
+      throw e;
+    }
     return { agent, apiKey, rotated: Boolean(existing) };
   }
 

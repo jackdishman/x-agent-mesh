@@ -40,7 +40,16 @@ describe("plugin files", () => {
 
   it("the migration holds the three tables with RLS on", () => {
     const dir = join(root, "supabase/migrations");
-    expect(readdirSync(dir)).toEqual(["20261116000000_x_agent_mesh_v0.sql"]);
+    const files = readdirSync(dir).sort();
+    expect(files[0]).toBe("20261116000000_x_agent_mesh_v0.sql");
+    // Later migrations are additive: they are marked as unapplied, and none drops, deletes or truncates.
+    for (const f of files.slice(1)) {
+      expect(f).toMatch(/^\d{14}_[a-z0-9_]+\.sql$/);
+      const later = read(`supabase/migrations/${f}`);
+      expect(later).toContain("NOT APPLIED ANYWHERE");
+      const statements = later.replace(/--.*$/gm, "");
+      expect(statements).not.toMatch(/\b(drop\s+(table|column|index|schema)|delete\s+from|truncate)\b/i);
+    }
     const sql = read("supabase/migrations/20261116000000_x_agent_mesh_v0.sql");
     for (const t of ["mesh_agents", "mesh_threads", "mesh_messages"]) {
       expect(sql).toContain(`create table public.${t}`);
