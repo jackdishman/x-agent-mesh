@@ -38,6 +38,7 @@ export const RPC = {
   // Implementation-defined server errors (JSON-RPC reserves -32000..-32099 for these).
   unauthorized: -32010,
   forbidden: -32011,
+  quotaExceeded: -32012,
   rateLimited: -32029,
 } as const;
 
@@ -310,6 +311,9 @@ export async function handleA2A(mesh: Mesh, ctx: CallContext, raw: string): Prom
           return failure(id, RPC.forbidden, "Forbidden", e.message);
         case "conflict":
           return failure(id, RPC.unsupportedOperation, "This operation is not supported", e.message);
+        case "quota_exceeded":
+          // HTTP 200 like the other refusals: it is not a server fault and retrying cannot help.
+          return failure(id, RPC.quotaExceeded, "Storage quota exceeded", { detail: e.message, ...(e.details ?? {}) });
       }
     }
     console.error("[x-agent-mesh] a2a internal error:", e);

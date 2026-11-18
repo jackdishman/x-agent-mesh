@@ -555,7 +555,7 @@ describe("limits on sign-in starts and on what is kept in memory", () => {
   it("keeps one live verify link per agent and at most 10,000 in all", async () => {
     let t = 1_800_000_000_000;
     const mesh = newMesh({ xOAuth }, () => t);
-    const agent = (i: number): Agent => ({ id: `agent-${i}`, x_user_id: String(i), x_handle: `h${i}`, agent_card_url: null, display_name: null, owner_opt_in: true, opted_in_at: null, x_verified: false, api_key_hash: null, created_at: "", updated_at: "" });
+    const agent = (i: number): Agent => ({ id: `agent-${i}`, x_user_id: String(i), x_handle: `h${i}`, agent_card_url: null, display_name: null, owner_opt_in: true, opted_in_at: null, x_verified: false, api_key_hash: null, stored_bytes: 0, created_at: "", updated_at: "" });
     for (let i = 0; i < 50; i++) mesh.xauth.issueVerifyUrl(agent(1)); // re-issuing replaces
     expect(ticketsOf(mesh).size).toBe(1);
     const first = mesh.xauth.issueVerifyUrl(agent(2));

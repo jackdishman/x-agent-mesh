@@ -4,10 +4,10 @@
 import { randomUUID } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { SqliteStore } from "./sqlite-store.js";
-import { handleTaken, xUserIdTaken } from "./store-shared.js";
+import { handleTaken, messageBytes, quotaExceeded, threadBytes, xUserIdTaken, type WriteOptions } from "./store-shared.js";
 
 export { SqliteStore };
-export { StoreError, type StoreErrorCode } from "./store-shared.js";
+export { MESSAGE_OVERHEAD_BYTES, messageBytes, StoreError, THREAD_OVERHEAD_BYTES, threadBytes, type StoreErrorCode, type WriteOptions } from "./store-shared.js";
 
 export type ThreadStatus = "proposed" | "active" | "input_required" | "completed" | "declined" | "canceled";
 export type MessageKind = "proposal" | "accept" | "decline" | "update" | "escalation" | "payment_draft" | "status";
@@ -22,6 +22,13 @@ export interface Agent {
   opted_in_at: string | null;
   x_verified: boolean;
   api_key_hash: string | null;
+  /**
+   * Bytes this agent has stored: the threads it proposed and the messages it sent (the formula is
+   * in store-shared.ts). Kept by the store with every write; it is what the storage quota is
+   * measured against. A Supabase database without the quota migration has no such column: read it
+   * as 0 there.
+   */
+  stored_bytes: number;
   created_at: string;
   updated_at: string;
 }
@@ -70,7 +77,8 @@ export interface Store {
   insertAgent(a: NewAgent): Promise<Agent>;
   /** A patch that sets `x_handle` to one another agent holds (any case) gets StoreError `handle_taken`. */
   updateAgent(xUserId: string, patch: AgentPatch): Promise<Agent>;
-  insertThread(t: NewThread): Promise<Thread>;
+  /** Adds the thread's size to its proposer's stored_bytes, in the same step. See WriteOptions for the quota. */
+  insertThread(t: NewThread, opts?: WriteOptions): Promise<Thread>;
   getThread(id: string): Promise<Thread | null>;
   /**
    * Compare-and-set: applies `patch` only if the thread's `updated_at` is still `ifUpdatedAt`.
@@ -79,7 +87,8 @@ export interface Store {
   updateThread(id: string, patch: ThreadPatch, ifUpdatedAt: string): Promise<Thread | null>;
   /** Threads `xUserId` participates in, most recently updated first (at most 100). */
   listThreadsFor(xUserId: string, status?: ThreadStatus): Promise<Thread[]>;
-  insertMessage(m: NewMessage): Promise<StoredMessage>;
+  /** Adds the message's size to its sender's stored_bytes, in the same step. See WriteOptions for the quota. */
+  insertMessage(m: NewMessage, opts?: WriteOptions): Promise<StoredMessage>;
   /** The latest `limit` messages of a thread, oldest first. */
   listMessages(threadId: string, limit: number): Promise<StoredMessage[]>;
 }
@@ -125,7 +134,7 @@ export class MemoryStore implements Store {
     if (this.agents.has(a.x_user_id)) throw xUserIdTaken();
     this.checkHandleFree(a.x_handle, a.x_user_id);
     const at = this.stamp();
-    const row: Agent = { id: randomUUID(), x_verified: false, created_at: at, updated_at: at, ...a };
+    const row: Agent = { id: randomUUID(), x_verified: false, stored_bytes: 0, created_at: at, updated_at: at, ...a };
     this.agents.set(row.x_user_id, row);
     return clone(row);
   }
@@ -141,7 +150,15 @@ export class MemoryStore implements Store {
     const h = handle.toLowerCase();
     for (const a of this.agents.values()) if (a.x_user_id !== xUserId && a.x_handle.toLowerCase() === h) throw handleTaken();
   }
-  async insertThread(t: NewThread) {
+  /** Checks the limit and adds to the author's counter. No await before the write that follows, so the two are one step. */
+  private count(xUserId: string, bytes: number, opts?: WriteOptions): void {
+    const author = this.agents.get(xUserId);
+    const used = author?.stored_bytes ?? 0;
+    if (opts?.limitBytes !== undefined && used + bytes > opts.limitBytes) throw quotaExceeded(used, bytes, opts.limitBytes);
+    if (author) author.stored_bytes = used + bytes;
+  }
+  async insertThread(t: NewThread, opts?: WriteOptions) {
+    this.count(t.proposer_x_user_id, threadBytes(t), opts);
     const at = this.stamp();
     const row: Thread = { id: randomUUID(), created_at: at, updated_at: at, ...clone(t) };
     this.threads.set(row.id, row);
@@ -169,7 +186,8 @@ export class MemoryStore implements Store {
       .slice(0, 100)
       .map((t) => clone(t));
   }
-  async insertMessage(m: NewMessage) {
+  async insertMessage(m: NewMessage, opts?: WriteOptions) {
+    this.count(m.from_x_user_id, messageBytes(m.message), opts);
     const row: StoredMessage = { ...clone(m), id: m.id ?? randomUUID(), created_at: this.stamp() };
     this.messages.push(row);
     return clone(row);
@@ -221,7 +239,20 @@ export class SupabaseStore implements Store {
       await this.db.from("mesh_agents").update({ ...patch, updated_at: new Date().toISOString() }).eq("x_user_id", xUserId).select("*").single(),
     );
   }
-  async insertThread(t: NewThread) {
+  /**
+   * The counters are kept by database triggers (supabase/migrations: ..._mesh_agent_stored_bytes.sql);
+   * without that migration there is no stored_bytes column, usage reads as 0 and no quota applies.
+   * Unlike the other stores, the limit is checked just before the write, not in the same step:
+   * concurrent writes by one agent can overshoot it by the rows in flight.
+   */
+  private async checkLimit(xUserId: string, bytes: number, opts?: WriteOptions): Promise<void> {
+    if (opts?.limitBytes === undefined) return;
+    const row = one<{ stored_bytes?: number | string | null }>(await this.db.from("mesh_agents").select("*").eq("x_user_id", xUserId).maybeSingle());
+    const used = Number(row?.stored_bytes) || 0;
+    if (used + bytes > opts.limitBytes) throw quotaExceeded(used, bytes, opts.limitBytes);
+  }
+  async insertThread(t: NewThread, opts?: WriteOptions) {
+    await this.checkLimit(t.proposer_x_user_id, threadBytes(t), opts);
     return must<Thread>(await this.db.from("mesh_threads").insert(t).select("*").single());
   }
   async getThread(id: string) {
@@ -243,7 +274,8 @@ export class SupabaseStore implements Store {
     if (status) q = q.eq("status", status);
     return many<Thread>(await q.order("updated_at", { ascending: false }).limit(100));
   }
-  async insertMessage(m: NewMessage) {
+  async insertMessage(m: NewMessage, opts?: WriteOptions) {
+    await this.checkLimit(m.from_x_user_id, messageBytes(m.message), opts);
     return must<StoredMessage>(await this.db.from("mesh_messages").insert(m).select("*").single());
   }
   async listMessages(threadId: string, limit: number) {
@@ -304,6 +336,8 @@ export function createStore(env: NodeJS.ProcessEnv = process.env): Store {
     return new MemoryStore();
   }
   const store = new SqliteStore(env.MESH_SQLITE_PATH?.trim() || DEFAULT_SQLITE_PATH);
-  console.error(`[x-agent-mesh] store: SQLite (${store.path})`);
+  const u = store.usageAtStart;
+  const kb = (n: number) => Math.ceil(n / 1024);
+  console.error(`[x-agent-mesh] store: SQLite (${store.path}); ${u.agents} agents have stored ${kb(u.totalBytes)} KB in all (largest: ${kb(u.largestBytes)} KB)`);
   return store;
 }

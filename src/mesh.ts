@@ -4,17 +4,19 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { LIMITS, type MeshConfig } from "./config.js";
 import { RateLimiter } from "./ratelimit.js";
-import { StoreError, type Agent, type MessageKind, type Store, type StoredMessage, type Thread, type ThreadStatus } from "./store.js";
+import { messageBytes, StoreError, threadBytes, type Agent, type MessageKind, type NewThread, type Store, type StoredMessage, type Thread, type ThreadStatus } from "./store.js";
 import { clean, cleanData } from "./untrusted.js";
 import { UNVERIFIED_NOTE, XAuth } from "./xauth.js";
 
-export type MeshErrorCode = "unauthorized" | "forbidden" | "not_found" | "invalid" | "conflict" | "rate_limited";
+export type MeshErrorCode = "unauthorized" | "forbidden" | "not_found" | "invalid" | "conflict" | "rate_limited" | "quota_exceeded";
 
 export class MeshError extends Error {
   constructor(
     public code: MeshErrorCode,
     message: string,
     public retryAfterSeconds?: number,
+    /** Extra fields for the caller, shown next to the message (numbers only: never text from another agent). */
+    public details?: Record<string, number>,
   ) {
     super(message);
   }
@@ -37,6 +39,8 @@ const OPEN: ThreadStatus[] = ["active", "input_required"];
 const TERMINAL: ThreadStatus[] = ["completed", "declined", "canceled"];
 const NO_THREAD = "No such thread, or you are not a participant in it.";
 const MAX_MUTUAL_SETS = 5000;
+/** Stands in for a thread id that does not exist yet, when measuring a message. */
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 /** What a stored row costs besides its text: ids, timestamps, the A2A envelope. */
 const WRITE_OVERHEAD_BYTES = 512;
 
@@ -91,6 +95,54 @@ export class Mesh {
   private charge(self: Agent, bytes: number) {
     const wait = this.writeLimiter.take(self.id, bytes + WRITE_OVERHEAD_BYTES);
     if (wait > 0) throw new MeshError("rate_limited", `This agent has stored as much as it may for now. Wait ${wait} seconds before writing again; do not retry in a loop.`, wait);
+  }
+
+  // ---- storage quota ----
+  //
+  // The write budget above is a rate, kept in memory. The quota is a total, kept by the store in
+  // Agent.stored_bytes: it survives restarts and never refills. Every write path goes through
+  // `admit` before it changes anything (so a refused write leaves no half-done state), and passes
+  // the same limit to the store, which checks it again in the same step as the insert (so
+  // concurrent writes cannot slip past together).
+
+  /** The most `stored_bytes` a write may leave the agent at, or undefined when there is no quota. `control`: see LIMITS.quotaControlReserveBytes. */
+  private quotaLimit(control = false): number | undefined {
+    const quota = this.cfg.agentQuotaBytes;
+    return quota > 0 ? quota + (control ? LIMITS.quotaControlReserveBytes : 0) : undefined;
+  }
+
+  private quotaError(usedBytes: number): MeshError {
+    const quota = this.cfg.agentQuotaBytes;
+    const kb = (n: number) => Math.ceil(n / 1024);
+    return new MeshError(
+      "quota_exceeded",
+      `This agent's storage quota on this mesh is used up (${kb(usedBytes)} KB stored, quota ${kb(quota)} KB). Nothing was stored. The quota does not refill, so waiting or retrying will not help: tell your owner, who can ask the mesh operator to raise it. You can still read your threads, and accept, decline, cancel or complete them.`,
+      undefined,
+      { used_bytes: usedBytes, quota_bytes: quota },
+    );
+  }
+
+  /** What an agent has stored and may store; `quota_bytes` is null when the mesh has no quota. */
+  storage(self: Agent): { used_bytes: number; quota_bytes: number | null } {
+    return { used_bytes: Number(self.stored_bytes) || 0, quota_bytes: this.cfg.agentQuotaBytes > 0 ? this.cfg.agentQuotaBytes : null };
+  }
+
+  /** Refuses, before anything is changed, a write of `bytes` stored bytes that would take `self` past its quota. Returns the limit to pass to the store. */
+  private admit(self: Agent, bytes: number, control = false): number | undefined {
+    const limit = this.quotaLimit(control);
+    const used = Number(self.stored_bytes) || 0;
+    if (limit !== undefined && used + bytes > limit) throw this.quotaError(used);
+    return limit;
+  }
+
+  /** Runs a store write, turning the store's own quota refusal (a concurrent write got there first) into the same error `admit` gives. */
+  private async stored<T>(write: () => Promise<T>): Promise<T> {
+    try {
+      return await write();
+    } catch (e) {
+      if (e instanceof StoreError && e.code === "quota_exceeded") throw this.quotaError(e.usage?.usedBytes ?? 0);
+      throw e;
+    }
   }
 
   // ---- auth and limits ----
@@ -264,15 +316,14 @@ export class Mesh {
     if (missing.length) throw new MeshError("forbidden", `Not registered, opted-in${this.cfg.requireVerified ? ", verified" : ""} mesh agents: ${missing.join(", ")}.`);
 
     // The goal is stored twice: on the thread and as its first message.
+    const row: NewThread = { goal, proposer_x_user_id: self.x_user_id, participants: [self.x_user_id, ...others], accepted_by: [self.x_user_id], status: "proposed" };
+    // The first message names the thread, whose id does not exist yet: measure it with an id of the same length.
+    const firstBytes = messageBytes(this.compose(NIL_UUID, self, { text: goal }));
+    const limit = this.admit(self, threadBytes(row) + firstBytes);
     this.charge(self, 2 * Buffer.byteLength(goal));
-    const thread = await this.store.insertThread({
-      goal,
-      proposer_x_user_id: self.x_user_id,
-      participants: [self.x_user_id, ...others],
-      accepted_by: [self.x_user_id],
-      status: "proposed",
-    });
-    await this.record(thread.id, self, "proposal", { text: goal });
+    // The thread is only let in if its first message will fit after it.
+    const thread = await this.stored(() => this.store.insertThread(row, limit === undefined ? undefined : { limitBytes: limit - firstBytes }));
+    await this.record(thread.id, self, "proposal", this.compose(thread.id, self, { text: goal }), false, limit);
     return thread;
   }
 
@@ -304,25 +355,29 @@ export class Mesh {
     throw new MeshError("conflict", "The thread is being changed by other participants. Try again shortly.");
   }
 
-  private async record(threadId: string, self: Agent, kind: MessageKind, m: { text: string; data?: Record<string, unknown>; needsHuman?: boolean; role?: "agent" | "user"; messageId?: string }): Promise<StoredMessage> {
-    return this.store.insertMessage({
-      thread_id: threadId,
-      from_x_user_id: self.x_user_id,
-      kind,
-      needs_human: m.needsHuman ?? false,
-      message: {
-        kind: "message",
-        role: m.role ?? "agent",
-        parts: [{ kind: "text", text: m.text }, ...(m.data ? [{ kind: "data", data: m.data }] : [])],
-        messageId: m.messageId ?? randomUUID(),
-        contextId: threadId,
-        taskId: threadId,
-        metadata: { from_x_user_id: self.x_user_id, from_x_handle: self.x_handle },
-      },
-    });
+  /** The A2A message that will be stored: built before anything is written, so its exact size can be checked against the quota first. */
+  private compose(threadId: string, self: Agent, m: { text: string; data?: Record<string, unknown>; role?: "agent" | "user"; messageId?: string }): Record<string, unknown> {
+    return {
+      kind: "message",
+      role: m.role ?? "agent",
+      parts: [{ kind: "text", text: m.text }, ...(m.data ? [{ kind: "data", data: m.data }] : [])],
+      messageId: m.messageId ?? randomUUID(),
+      contextId: threadId,
+      taskId: threadId,
+      metadata: { from_x_user_id: self.x_user_id, from_x_handle: self.x_handle },
+    };
+  }
+
+  /** Stores a composed message. `limitBytes` is what `admit` returned for it. */
+  private async record(threadId: string, self: Agent, kind: MessageKind, message: Record<string, unknown>, needsHuman: boolean, limitBytes: number | undefined): Promise<StoredMessage> {
+    return this.stored(() =>
+      this.store.insertMessage({ thread_id: threadId, from_x_user_id: self.x_user_id, kind, needs_human: needsHuman, message }, limitBytes === undefined ? undefined : { limitBytes }),
+    );
   }
 
   async accept(self: Agent, threadId: string, accept: boolean): Promise<Thread> {
+    const note = this.compose(threadId, self, { text: accept ? "Accepted the goal." : "Declined the goal." });
+    const limit = this.admit(self, messageBytes(note), true);
     this.charge(self, 0);
     const thread = await this.transition(self, threadId, (t) => {
       if (t.status !== "proposed") throw new MeshError("conflict", `This thread is ${t.status}; only a proposed thread can be accepted or declined.`);
@@ -330,20 +385,23 @@ export class Mesh {
       const accepted = [...new Set([...t.accepted_by, self.x_user_id])];
       return { accepted_by: accepted, status: t.participants.every((p) => accepted.includes(p)) ? "active" : "proposed" };
     });
-    await this.record(threadId, self, accept ? "accept" : "decline", { text: accept ? "Accepted the goal." : "Declined the goal." });
+    await this.record(threadId, self, accept ? "accept" : "decline", note, false, limit);
     return thread;
   }
 
   async post(self: Agent, threadId: string, input: PostInput): Promise<{ thread: Thread; message: StoredMessage }> {
     if (input.needsHuman && input.setStatus) throw new MeshError("invalid", "needs_human and set_status cannot be combined.");
     if (input.data && Buffer.byteLength(JSON.stringify(input.data)) > LIMITS.dataBytes) throw new MeshError("invalid", `data is limited to ${LIMITS.dataBytes} bytes of JSON.`);
+    const composed = this.compose(threadId, self, input);
+    // A post that resumes or completes the thread may use the reserve: a full agent can still close its threads.
+    const limit = this.admit(self, messageBytes(composed), input.setStatus !== undefined);
     this.charge(self, Buffer.byteLength(input.text) + (input.data ? Buffer.byteLength(JSON.stringify(input.data)) : 0));
     const thread = await this.transition(self, threadId, (t) => {
       if (!OPEN.includes(t.status)) throw new MeshError("conflict", `This thread is ${t.status}; updates need an active or input_required thread.`);
       const next: ThreadStatus = input.needsHuman ? "input_required" : (input.setStatus ?? t.status);
       return next === t.status ? null : { status: next };
     });
-    const message = await this.record(threadId, self, input.kind ?? (input.setStatus ? "status" : "update"), input);
+    const message = await this.record(threadId, self, input.kind ?? (input.setStatus ? "status" : "update"), composed, input.needsHuman ?? false, limit);
     return { thread, message };
   }
 
@@ -368,7 +426,6 @@ export class Mesh {
     if (!payee || !t.participants.includes(payee.x_user_id) || payee.x_user_id === self.x_user_id) {
       throw new MeshError("forbidden", "Payment drafts can only name another participant of this thread as the payee.");
     }
-    this.charge(self, Buffer.byteLength(p.memo));
     const draft = {
       type: "payment_draft",
       status: "draft" as const,
@@ -380,19 +437,26 @@ export class Mesh {
       currency: p.currency,
       memo: p.memo,
     };
-    const message = await this.record(threadId, self, "payment_draft", {
+    const composed = this.compose(threadId, self, {
       text: `Payment draft (not sent, moves no money): @${self.x_handle} proposes to pay @${payee.x_handle} ${p.amount} ${p.currency}.`,
       data: draft,
     });
+    const limit = this.admit(self, messageBytes(composed));
+    this.charge(self, Buffer.byteLength(p.memo));
+    const message = await this.record(threadId, self, "payment_draft", composed, false, limit);
     return { thread: t, draft: { draft_id: message.id, thread_id: threadId, ...draft, created_at: message.created_at } };
   }
 
   async cancel(self: Agent, threadId: string): Promise<Thread> {
+    // Never charged to the write budget, and allowed into the quota's reserve: an agent that is
+    // out of either can still cancel.
+    const note = this.compose(threadId, self, { text: "Canceled the thread." });
+    const limit = this.admit(self, messageBytes(note), true);
     const thread = await this.transition(self, threadId, (t) => {
       if (TERMINAL.includes(t.status)) throw new MeshError("conflict", `This thread is already ${t.status} and cannot be canceled.`);
       return { status: "canceled" };
     });
-    await this.record(threadId, self, "status", { text: "Canceled the thread." });
+    await this.record(threadId, self, "status", note, false, limit);
     return thread;
   }
 }
