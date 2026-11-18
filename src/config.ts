@@ -23,6 +23,13 @@ export const xOAuthConfigured = (cfg: MeshConfig): boolean => cfg.xOAuth.clientI
 export interface MeshConfig {
   /** Public base URL of this server, no trailing slash (used in agent cards). */
   publicUrl: string;
+  /**
+   * MESH_ALLOWED_ORIGINS: the browser origins that may call POST /mcp and /a2a (DNS-rebinding
+   * protection). A request with an `Origin` header that is not in this list is refused; a request
+   * with no `Origin` header (every non-browser agent client) is always let through. Defaults to
+   * the origin of `publicUrl`. "*" = any origin (the check is off).
+   */
+  allowedOrigins: string[] | "*";
   /** MESH_REQUIRE_VERIFIED=1: unverified agents are invisible to list_mutual_agents and cannot propose. */
   requireVerified: boolean;
   /** Per-agent limit on MCP tool calls and A2A JSON-RPC calls. */
@@ -108,6 +115,43 @@ function baseUrl(name: string, raw: string): string {
   return raw.replace(/\/+$/, "");
 }
 
+/**
+ * The form an origin is compared in, or null when `raw` is not one. An http(s) origin is
+ * scheme://host[:port] with the default port dropped and the host in lower case (what the URL
+ * parser gives); anything with a path, query, fragment or credentials is not an origin. "null" (what
+ * browsers send from sandboxed or file: pages) and other schemes (chrome-extension://...) are kept
+ * as written, lower-cased, so they match only an identical allowlist entry.
+ */
+export function normalizeOrigin(raw: string): string | null {
+  const s = raw.trim();
+  if (s === "" || /[\s,]/.test(s)) return null;
+  if (s.toLowerCase() === "null") return "null";
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.username || u.password || u.search || u.hash) return null;
+  if (u.protocol === "https:" || u.protocol === "http:") return u.pathname === "/" ? u.origin : null;
+  return s.replace(/\/+$/, "").toLowerCase();
+}
+
+function allowedOrigins(env: NodeJS.ProcessEnv, publicUrl: string): string[] | "*" {
+  const raw = (env.MESH_ALLOWED_ORIGINS ?? "").trim();
+  if (raw === "") return [new URL(publicUrl).origin];
+  if (raw === "*") return "*";
+  const out = new Set<string>();
+  for (const entry of raw.split(/[\s,]+/).filter(Boolean)) {
+    const origin = entry === "*" ? null : normalizeOrigin(entry);
+    if (origin === null) {
+      throw new Error(`MESH_ALLOWED_ORIGINS: "${entry}" is not an origin. List origins like https://app.example.com (scheme and host, no path), separated by commas; or set it to * alone to allow any.`);
+    }
+    out.add(origin);
+  }
+  return [...out];
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
   const port = num(env, "PORT", 8787);
   const adminToken = env.MESH_ADMIN_TOKEN ?? "";
@@ -127,6 +171,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
   }
   return {
     publicUrl,
+    allowedOrigins: allowedOrigins(env, publicUrl),
     requireVerified: env.MESH_REQUIRE_VERIFIED === "1",
     agentRate: {
       capacity: num(env, "MESH_RATE_BURST", 20),
@@ -158,6 +203,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
 export function testConfig(over: Partial<MeshConfig> = {}): MeshConfig {
   return {
     publicUrl: "https://mesh.test",
+    allowedOrigins: ["https://mesh.test"],
     requireVerified: false,
     agentRate: { capacity: 1000, refillPerSec: 1000 },
     ipRate: { capacity: 1000, refillPerSec: 1000 },
