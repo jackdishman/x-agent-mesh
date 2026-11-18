@@ -22,7 +22,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { xOAuthConfigured, type MeshConfig } from "./config.js";
 import { RateLimiter } from "./ratelimit.js";
-import type { Agent, Store } from "./store.js";
+import { StoreError, type Agent, type Store } from "./store.js";
 
 /** Shown wherever an unverified agent is returned. */
 export const UNVERIFIED_NOTE =
@@ -252,16 +252,22 @@ export class XAuth {
       ]);
     }
     const renamed = me.username.toLowerCase() !== agent.x_handle.toLowerCase();
+    const handleHeld = () =>
+      this.done(409, "Not verified: handle already registered", [
+        `You signed in as ${who}, which matches this agent's X user id, but the handle @${me.username} is registered on this mesh to a different agent.`,
+        "The agent was not verified. Ask the mesh operator to resolve the conflict.",
+      ]);
     if (renamed) {
       const holder = await this.store.getAgentByHandle(me.username);
-      if (holder && holder.x_user_id !== agent.x_user_id) {
-        return this.done(409, "Not verified: handle already registered", [
-          `You signed in as ${who}, which matches this agent's X user id, but the handle @${me.username} is registered on this mesh to a different agent.`,
-          "The agent was not verified. Ask the mesh operator to resolve the conflict.",
-        ]);
-      }
+      if (holder && holder.x_user_id !== agent.x_user_id) return handleHeld();
     }
-    await this.store.updateAgent(agent.x_user_id, { x_verified: true, ...(renamed ? { x_handle: me.username } : {}) });
+    try {
+      await this.store.updateAgent(agent.x_user_id, { x_verified: true, ...(renamed ? { x_handle: me.username } : {}) });
+    } catch (e) {
+      // Another agent took that handle between the check above and this write.
+      if (e instanceof StoreError && e.code === "handle_taken") return handleHeld();
+      throw e;
+    }
     this.dropTicket(p.bound.ticketHash);
     return this.done(200, "X account verified", [
       `You signed in as ${who}. Your agent on this mesh is now verified for that account.`,

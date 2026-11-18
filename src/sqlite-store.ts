@@ -6,6 +6,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { Agent, AgentPatch, NewAgent, NewMessage, NewThread, Store, StoredMessage, Thread, ThreadPatch, ThreadStatus } from "./store.js";
+import { handleTaken, StoreError, xUserIdTaken } from "./store-shared.js";
 
 const SCHEMA = `
 create table if not exists mesh_agents (
@@ -46,7 +47,13 @@ create table if not exists mesh_messages (
 create index if not exists mesh_messages_thread_idx on mesh_messages (thread_id, created_at);
 `;
 
+/** One agent per handle, whatever its case. Created at start-up only when the existing rows allow it. */
+const HANDLE_UNIQUE_INDEX = "mesh_agents_handle_uniq";
+
 type Row = Record<string, unknown>;
+
+/** A database failure that was already logged and reworded: passed up as it is. */
+class Unavailable extends Error {}
 
 /**
  * Loads `node:sqlite` on first use, so that a server on another store never touches it, and keeps
@@ -78,6 +85,11 @@ export class SqliteStore implements Store {
   readonly path: string;
   private db: DatabaseSync;
   private last = 0;
+  /**
+   * Whether the unique index on lower(x_handle) exists. False only when the file already held two
+   * agents with one handle: the server still starts, and writes are still checked in a transaction.
+   */
+  handlesUnique = false;
 
   /** Opens (creating the file, its directory and the schema as needed) the database at `path`; ":memory:" for a private one. */
   constructor(path: string) {
@@ -87,6 +99,31 @@ export class SqliteStore implements Store {
     this.db = new DatabaseSync(this.path);
     this.db.exec("pragma journal_mode = WAL; pragma foreign_keys = ON; pragma busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    this.ensureHandleIndex();
+  }
+
+  /**
+   * Adds the unique index on lower(x_handle) to a database made by an earlier version. Never fails
+   * start-up and never touches a row: if two agents already share a handle the index is skipped
+   * with a warning, and tried again on the next start.
+   */
+  private ensureHandleIndex(): void {
+    try {
+      this.tx(() => {
+        const dups = this.all("select lower(x_handle) as handle, count(*) as n from mesh_agents group by lower(x_handle) having count(*) > 1 order by 1 limit 5");
+        if (dups.length > 0) {
+          const shown = dups.map((d) => `@${String(d.handle)} (${String(d.n)} agents)`).join(", ");
+          console.error(
+            `[x-agent-mesh] WARNING: handles registered more than once: ${shown}${dups.length === 5 ? ", ..." : ""}. The unique index ${HANDLE_UNIQUE_INDEX} was NOT created and no row was changed. New duplicates are still refused. Resolve these by hand, then restart.`,
+          );
+          return;
+        }
+        this.db.exec(`create unique index if not exists ${HANDLE_UNIQUE_INDEX} on mesh_agents (lower(x_handle))`);
+        this.handlesUnique = true;
+      });
+    } catch {
+      console.error(`[x-agent-mesh] WARNING: could not create the unique index ${HANDLE_UNIQUE_INDEX}; continuing without it.`);
+    }
   }
 
   close(): void {
@@ -105,9 +142,41 @@ export class SqliteStore implements Store {
     try {
       return fn();
     } catch (e) {
-      console.error(`[x-agent-mesh] sqlite error: ${e instanceof Error ? e.message : String(e)}`);
-      throw new Error("The mesh database is unavailable or rejected the request.");
+      if (e instanceof StoreError || e instanceof Unavailable) throw e;
+      const text = e instanceof Error ? e.message : String(e);
+      // The unique indexes are the last line of defence behind the checks in insertAgent / updateAgent.
+      if (/UNIQUE constraint failed/i.test(text)) {
+        if (text.includes(HANDLE_UNIQUE_INDEX)) throw handleTaken();
+        if (text.includes("mesh_agents.x_user_id")) throw xUserIdTaken();
+      }
+      console.error(`[x-agent-mesh] sqlite error: ${text}`);
+      throw new Unavailable("The mesh database is unavailable or rejected the request.");
     }
+  }
+  /**
+   * Runs `fn` in one write transaction. BEGIN IMMEDIATE takes the write lock up front, so a check
+   * followed by a write cannot interleave with another connection to the same file.
+   */
+  private tx<T>(fn: () => T): T {
+    return this.run(() => {
+      this.db.exec("begin immediate");
+      try {
+        const out = fn();
+        this.db.exec("commit");
+        return out;
+      } catch (e) {
+        try {
+          this.db.exec("rollback");
+        } catch {
+          /* the failed statement already ended the transaction */
+        }
+        throw e;
+      }
+    });
+  }
+  /** Throws when another agent holds `handle` (compared without case). */
+  private checkHandleFree(handle: string, xUserId: string): void {
+    if (this.get("select 1 from mesh_agents where lower(x_handle) = lower(?) and x_user_id <> ? limit 1", handle, xUserId)) throw handleTaken();
   }
   private get(sql: string, ...params: SQLInputValue[]): Row | undefined {
     return this.run(() => this.db.prepare(sql).get(...params) as Row | undefined);
@@ -136,14 +205,18 @@ export class SqliteStore implements Store {
     return this.all("select * from mesh_agents where owner_opt_in = 1 and x_user_id in (select value from json_each(?))", ids).map((r) => agent(r)!);
   }
   async insertAgent(a: NewAgent) {
-    const at = this.stamp();
-    return agent(
-      this.must(
-        `insert into mesh_agents (id, x_user_id, x_handle, agent_card_url, display_name, owner_opt_in, opted_in_at, api_key_hash, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning *`,
-        randomUUID(), a.x_user_id, a.x_handle, a.agent_card_url, a.display_name, a.owner_opt_in ? 1 : 0, a.opted_in_at, a.api_key_hash, at, at,
-      ),
-    )!;
+    return this.tx(() => {
+      if (this.get("select 1 from mesh_agents where x_user_id = ?", a.x_user_id)) throw xUserIdTaken();
+      this.checkHandleFree(a.x_handle, a.x_user_id);
+      const at = this.stamp();
+      return agent(
+        this.must(
+          `insert into mesh_agents (id, x_user_id, x_handle, agent_card_url, display_name, owner_opt_in, opted_in_at, api_key_hash, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning *`,
+          randomUUID(), a.x_user_id, a.x_handle, a.agent_card_url, a.display_name, a.owner_opt_in ? 1 : 0, a.opted_in_at, a.api_key_hash, at, at,
+        ),
+      )!;
+    });
   }
   async updateAgent(xUserId: string, patch: AgentPatch) {
     const sets: string[] = [];
@@ -154,10 +227,13 @@ export class SqliteStore implements Store {
       sets.push(`${col} = ?`);
       params.push(typeof v === "boolean" ? (v ? 1 : 0) : v);
     }
-    const current = this.get("select updated_at from mesh_agents where x_user_id = ?", xUserId);
-    sets.push("updated_at = ?");
-    params.push(this.stamp(current?.updated_at as string | undefined));
-    return agent(this.must(`update mesh_agents set ${sets.join(", ")} where x_user_id = ? returning *`, ...params, xUserId))!;
+    return this.tx(() => {
+      if (patch.x_handle !== undefined) this.checkHandleFree(patch.x_handle, xUserId);
+      const current = this.get("select updated_at from mesh_agents where x_user_id = ?", xUserId);
+      sets.push("updated_at = ?");
+      params.push(this.stamp(current?.updated_at as string | undefined));
+      return agent(this.must(`update mesh_agents set ${sets.join(", ")} where x_user_id = ? returning *`, ...params, xUserId))!;
+    });
   }
   async insertThread(t: NewThread) {
     const at = this.stamp();

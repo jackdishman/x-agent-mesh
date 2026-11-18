@@ -97,7 +97,9 @@ describe("SqliteStore", () => {
     console.error = (...args: unknown[]) => void logged.push(args.map(String).join(" "));
     try {
       await store.insertAgent(agent("1", "alice", "hash-secretish"));
-      await expect(store.insertAgent(agent("1", "alice2", "hash-other"))).rejects.toThrow("The mesh database is unavailable or rejected the request.");
+      // A duplicate registration is an expected, typed refusal: not a database error, not logged.
+      await expect(store.insertAgent(agent("1", "alice2", "hash-other"))).rejects.toThrow("This x_user_id is already registered.");
+      await expect(store.insertMessage({ thread_id: "no-such-thread", from_x_user_id: "1", kind: "update", message: {}, needs_human: false })).rejects.toThrow("The mesh database is unavailable or rejected the request.");
       await expect(store.insertThread({ goal: "", proposer_x_user_id: "1", participants: ["1"], accepted_by: [], status: "proposed" })).rejects.toThrow(/^The mesh database is unavailable/);
       await expect(store.insertThread({ goal: "g", proposer_x_user_id: "nobody", participants: ["1"], accepted_by: [], status: "proposed" })).rejects.toThrow(/^The mesh database is unavailable/);
     } finally {
