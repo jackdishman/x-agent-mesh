@@ -47,6 +47,24 @@ create table if not exists mesh_messages (
 create index if not exists mesh_messages_thread_idx on mesh_messages (thread_id, created_at);
 `;
 
+/**
+ * Added after the first release. Everything here is additive (new tables and indexes, `if not
+ * exists`), so a database made by an earlier version gains it on the next start, and an earlier
+ * version of the server can still open the file afterwards: it simply ignores what it does not know.
+ *
+ * mesh_thread_participants: one row per (participant, thread), so "my threads" is an index lookup
+ * instead of a scan of every thread's JSON participant list. A thread's participants never change
+ * after it is created, so the rows are written once, with the thread.
+ */
+const SCHEMA_ADDITIONS = `
+create table if not exists mesh_thread_participants (
+  x_user_id text not null,
+  thread_id text not null references mesh_threads(id) on delete cascade,
+  primary key (x_user_id, thread_id)
+) without rowid;
+create index if not exists mesh_thread_participants_thread_idx on mesh_thread_participants (thread_id);
+`;
+
 /** One agent per handle, whatever its case. Created at start-up only when the existing rows allow it. */
 const HANDLE_UNIQUE_INDEX = "mesh_agents_handle_uniq";
 
@@ -99,7 +117,31 @@ export class SqliteStore implements Store {
     this.db = new DatabaseSync(this.path);
     this.db.exec("pragma journal_mode = WAL; pragma foreign_keys = ON; pragma busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    this.db.exec(SCHEMA_ADDITIONS);
     this.ensureHandleIndex();
+    this.backfillParticipants();
+  }
+
+  /**
+   * Gives every thread that has no participant rows its rows, from the thread's own JSON list.
+   * Runs at every start: it is a no-op once done (threads that already have rows are skipped by an
+   * index probe, and `insert or ignore` cannot duplicate), and it also picks up threads written by
+   * an earlier version of the server, should the file ever be opened by one in between.
+   * Returns how many rows were added.
+   */
+  private backfillParticipants(): number {
+    const added = this.tx(() => {
+      const r = this.db
+        .prepare(
+          `insert or ignore into mesh_thread_participants (x_user_id, thread_id)
+           select j.value, t.id from mesh_threads t, json_each(t.participants) j
+           where j.type = 'text' and not exists (select 1 from mesh_thread_participants p where p.thread_id = t.id)`,
+        )
+        .run();
+      return Number(r.changes);
+    });
+    if (added > 0) console.error(`[x-agent-mesh] sqlite: indexed ${added} thread participant rows (mesh_thread_participants backfill).`);
+    return added;
   }
 
   /**
@@ -236,14 +278,19 @@ export class SqliteStore implements Store {
     });
   }
   async insertThread(t: NewThread) {
-    const at = this.stamp();
-    return thread(
-      this.must(
-        `insert into mesh_threads (id, goal, proposer_x_user_id, participants, accepted_by, status, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?) returning *`,
-        randomUUID(), t.goal, t.proposer_x_user_id, JSON.stringify(t.participants), JSON.stringify(t.accepted_by), t.status, at, at,
-      ),
-    )!;
+    return this.tx(() => {
+      const at = this.stamp();
+      const row = thread(
+        this.must(
+          `insert into mesh_threads (id, goal, proposer_x_user_id, participants, accepted_by, status, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?) returning *`,
+          randomUUID(), t.goal, t.proposer_x_user_id, JSON.stringify(t.participants), JSON.stringify(t.accepted_by), t.status, at, at,
+        ),
+      )!;
+      const add = this.db.prepare("insert or ignore into mesh_thread_participants (x_user_id, thread_id) values (?, ?)");
+      for (const p of new Set(row.participants)) if (typeof p === "string") add.run(p, row.id);
+      return row;
+    });
   }
   async getThread(id: string) {
     return thread(this.get("select * from mesh_threads where id = ?", id));
@@ -266,10 +313,12 @@ export class SqliteStore implements Store {
     return thread(this.get(`update mesh_threads set ${sets.join(", ")} where id = ? and updated_at = ? returning *`, ...params, id, ifUpdatedAt));
   }
   async listThreadsFor(xUserId: string, status?: ThreadStatus) {
-    const member = "exists (select 1 from json_each(mesh_threads.participants) where value = ?)";
+    // CROSS JOIN fixes the join order: this agent's rows first (primary-key prefix), then each
+    // thread by id. Left to itself the planner may walk every thread in updated_at order instead.
+    const from = "from mesh_thread_participants p cross join mesh_threads t on t.id = p.thread_id where p.x_user_id = ?";
     const rows = status
-      ? this.all(`select * from mesh_threads where ${member} and status = ? order by updated_at desc, rowid desc limit 100`, xUserId, status)
-      : this.all(`select * from mesh_threads where ${member} order by updated_at desc, rowid desc limit 100`, xUserId);
+      ? this.all(`select t.* ${from} and t.status = ? order by t.updated_at desc, t.rowid desc limit 100`, xUserId, status)
+      : this.all(`select t.* ${from} order by t.updated_at desc, t.rowid desc limit 100`, xUserId);
     return rows.map((r) => thread(r)!);
   }
   async insertMessage(m: NewMessage) {

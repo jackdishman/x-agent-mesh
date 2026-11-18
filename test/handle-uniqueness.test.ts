@@ -47,7 +47,8 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   await closeServers();
 });
-const logged = () => errors.mock.calls.map((c: unknown[]) => c.map(String).join(" "));
+/** What was logged, minus the one-time notices of the other start-up migrations. */
+const logged = (): string[] => errors.mock.calls.map((c: unknown[]) => c.map(String).join(" ")).filter((l: string) => !/backfill|recomputed/.test(l));
 
 const STORES: [string, () => Store][] = [
   ["MemoryStore", () => new MemoryStore()],
