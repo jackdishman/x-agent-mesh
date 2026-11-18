@@ -151,7 +151,18 @@ export class XAuth {
 
     if (this.pending.size >= MAX_PENDING) {
       for (const [h, p] of this.pending) if (t > p.expires) this.pending.delete(h);
-      if (this.pending.size >= MAX_PENDING) this.pending.delete(this.pending.keys().next().value as string);
+      if (this.pending.size >= MAX_PENDING) {
+        // Anyone can start a ticketless ("who am I") sign-in, so those give way first: a flood of
+        // them must not push out an owner who is half-way through verifying an agent.
+        let victim = this.pending.keys().next().value as string;
+        for (const [h, p] of this.pending) {
+          if (!p.bound) {
+            victim = h;
+            break;
+          }
+        }
+        this.pending.delete(victim);
+      }
     }
     const state = token();
     const verifier = token();
