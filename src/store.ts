@@ -90,6 +90,8 @@ export class MemoryStore implements Store {
   readonly kind = "memory" as const;
   private agents = new Map<string, Agent>(); // by x_user_id
   private threads = new Map<string, Thread>();
+  /** x_user_id → ids of the threads it participates in (participants never change after insert). */
+  private threadsOf = new Map<string, Set<string>>();
   private messages: StoredMessage[] = [];
   private last = 0;
 
@@ -143,6 +145,11 @@ export class MemoryStore implements Store {
     const at = this.stamp();
     const row: Thread = { id: randomUUID(), created_at: at, updated_at: at, ...clone(t) };
     this.threads.set(row.id, row);
+    for (const p of row.participants) {
+      const mine = this.threadsOf.get(p);
+      if (mine) mine.add(row.id);
+      else this.threadsOf.set(p, new Set([row.id]));
+    }
     return clone(row);
   }
   async getThread(id: string) {
@@ -155,8 +162,9 @@ export class MemoryStore implements Store {
     return clone(row);
   }
   async listThreadsFor(xUserId: string, status?: ThreadStatus) {
-    return [...this.threads.values()]
-      .filter((t) => t.participants.includes(xUserId) && (!status || t.status === status))
+    return [...(this.threadsOf.get(xUserId) ?? [])]
+      .map((id) => this.threads.get(id)!)
+      .filter((t) => !status || t.status === status)
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
       .slice(0, 100)
       .map((t) => clone(t));
