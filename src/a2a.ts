@@ -160,8 +160,9 @@ const sendParams = z.object({
     messageId: z.string().min(1).max(128),
     contextId: z.string().uuid().optional(),
     taskId: z.string().uuid().optional(),
-    referenceTaskIds: z.array(z.string()).optional(),
-    extensions: z.array(z.string()).optional(),
+    // Accepted for compatibility and ignored: bounded all the same.
+    referenceTaskIds: z.array(z.string().max(128)).max(100).optional(),
+    extensions: z.array(z.string().max(500)).max(100).optional(),
     metadata: meta.optional(),
   }),
   configuration: z.object({ historyLength: z.number().int().min(0).optional() }).loose().optional(),

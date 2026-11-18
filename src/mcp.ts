@@ -33,7 +33,22 @@ const xUserId = z.string().regex(/^\d{1,20}$/, "an X user id is 1-20 digits");
 const xHandle = z.string().regex(/^@?[A-Za-z0-9_]{1,15}$/, "an X handle is 1-15 letters, digits or underscores");
 const idList = z.array(xUserId).max(LIMITS.ids);
 const threadId = z.string().uuid();
-const httpsUrl = z.string().max(500).url().refine((u) => u.startsWith("https://"), "must be an https:// URL");
+/** Stored and shown to other agents, never fetched by the server. No credentials, whitespace or control characters. */
+const httpsUrl = z
+  .string()
+  .max(500)
+  .url()
+  .refine((u) => {
+    if (!u.startsWith("https://") || /[\s\p{Cc}\p{Cf}]/u.test(u)) return false;
+    try {
+      const parsed = new URL(u);
+      return parsed.protocol === "https:" && parsed.username === "" && parsed.password === "" && parsed.hostname !== "";
+    } catch {
+      return false;
+    }
+  }, "must be an https:// URL without credentials or whitespace");
+/** Text that is more than whitespace (it is shown to people). */
+const words = (max: number) => z.string().min(1).max(max).refine((s) => s.trim() !== "", "must not be blank");
 const STATUSES = ["proposed", "active", "input_required", "completed", "declined", "canceled"] as const;
 
 const text = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }] });
@@ -45,8 +60,10 @@ export function errorResult(e: unknown) {
       isError: true,
     };
   }
-  // Unexpected errors can quote stored text: cleaned like any other.
-  return { ...text({ error: "internal", message: clean(String((e as Error)?.message ?? e), 500) }), isError: true };
+  // An unexpected error's own text can quote stored data or internals: it goes to the operator's
+  // log, and the caller only learns that something failed.
+  console.error("[x-agent-mesh] tool failed:", e);
+  return { ...text({ error: "internal", message: "The mesh could not complete this request. Try again later." }), isError: true };
 }
 
 export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
@@ -81,7 +98,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
       x_user_id: xUserId.describe("The owner's numeric X user id"),
       x_handle: xHandle.describe("The owner's X handle"),
       agent_card_url: httpsUrl.optional().describe("Your own A2A agent card URL, if you host one"),
-      display_name: z.string().min(1).max(100).optional(),
+      display_name: words(100).optional(),
       owner_opt_in: z.literal(true).describe("Must be true: the owner explicitly agreed to be discoverable by mutuals' agents"),
       admin_token: z.string().min(1).max(512).optional().describe("Invite token from the mesh operator; required when the mesh is invite-only (alternative: X-Mesh-Admin-Token header)"),
     },
@@ -140,7 +157,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
     "propose_goal",
     "Propose a shared goal to mutuals' agents. Every participant must be among your mutuals (as last given to list_mutual_agents within 24h, or pass follower_ids and following_ids here) and be a registered, opted-in agent. Creates a thread in status 'proposed'; you are auto-accepted. It becomes active when all participants accept.",
     {
-      goal: z.string().min(1).max(LIMITS.goal),
+      goal: words(LIMITS.goal),
       participant_x_user_ids: z.array(xUserId).min(1).max(LIMITS.participants),
       follower_ids: idList.optional().describe("Optional: supply the mutual lists now instead of relying on the remembered set"),
       following_ids: idList.optional(),
@@ -169,7 +186,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
     "Post an update to an active (or input_required) thread you participate in. needs_human: true marks the thread input_required. set_status: 'active' resumes an input_required thread once the human answered; 'completed' closes the thread. Only send what your owner would be fine sharing with the other participants.",
     {
       thread_id: threadId,
-      text: z.string().min(1).max(LIMITS.text),
+      text: words(LIMITS.text),
       needs_human: z.boolean().optional(),
       data: z.record(z.string(), z.unknown()).optional().describe("Optional structured data (JSON object, at most 16 KB)"),
       set_status: z.enum(["active", "completed"]).optional(),
@@ -207,7 +224,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
     "Use when a thread needs your owner's decision. Records an escalation, marks the thread input_required, and returns `ask_owner`: the question for YOU to ask your owner. It does not message anyone itself. Afterwards relay only what the owner approved (post_update, set_status: 'active').",
     {
       thread_id: threadId,
-      question: z.string().min(1).max(LIMITS.question),
+      question: words(LIMITS.question),
       context: z.string().max(2000).optional(),
     },
     async (a) => {
