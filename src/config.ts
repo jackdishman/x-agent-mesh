@@ -65,8 +65,6 @@ export const LIMITS = {
   bodyBytes: 1_048_576,
   /** POST /a2a: no id lists, so a message (text + 16 KB of data) never needs more. */
   a2aBodyBytes: 262_144,
-  /** Longest bearer key / invite token header the server looks at. Real keys are 47 characters. */
-  credentialChars: 512,
   /** Total ids across all remembered mutual sets (the cache is the largest thing held in memory). */
   mutualIdsTotal: 200_000,
   /** The smallest per-agent write budget: one maximal message must always fit. */
