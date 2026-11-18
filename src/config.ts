@@ -39,6 +39,20 @@ export interface MeshConfig {
   /** Per-IP limit on every HTTP request except /healthz, taken before any routing, parsing or auth. */
   httpRate: BucketConfig;
   /**
+   * Per-IP limit on agent-card lookups by handle (GET /agents/<handle>/.well-known/agent-card.json),
+   * the one unauthenticated way to ask "is this handle registered here?".
+   */
+  cardRate: BucketConfig;
+  /**
+   * Per-agent budget of NEW X user ids an agent may check for registered agents through its
+   * mutual lists (list_mutual_agents, propose_goal with lists): capacity in ids, refill in ids per
+   * second. Ids already in the set the agent last supplied are free, so repeating or slightly
+   * updating a real mutual list costs little; cycling through lists of other people's ids does not.
+   */
+  mutualRate: BucketConfig;
+  /** The same budget per client address, across all the agents calling from it. */
+  mutualIpRate: BucketConfig;
+  /**
    * Per-agent budget of stored bytes (goals, message text and data): capacity in bytes, refill in
    * bytes per second. Keeps one agent from filling the disk; the request-count limit alone would
    * let a single key store about 1 GB a day.
@@ -162,6 +176,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
   const redirectUri = (env.X_REDIRECT_URI ?? "").trim() || `${publicUrl}/auth/x/callback`;
   baseUrl("X_REDIRECT_URI", redirectUri);
   const writeBytesPerDay = Math.max(LIMITS.minWriteBurstBytes, Math.floor(num(env, "MESH_WRITE_KB_PER_DAY", 5120) * 1024));
+  // Never less than one maximal list, so a first call with a full (10,000 id) mutual set always fits.
+  const mutualIdsPerDay = Math.max(LIMITS.ids, Math.floor(num(env, "MESH_MUTUAL_IDS_PER_DAY", 30_000)));
+  const mutualIdsPerDayPerIp = Math.max(mutualIdsPerDay, Math.floor(num(env, "MESH_MUTUAL_IDS_PER_DAY_PER_IP", 300_000)));
   // 0 turns the quota off; anything else is at least one maximal message.
   const quotaRaw = (env.MESH_AGENT_QUOTA_KB ?? "").trim();
   const agentQuotaBytes = /^0+(\.0+)?$/.test(quotaRaw) ? 0 : Math.max(LIMITS.minWriteBurstBytes, Math.floor(num(env, "MESH_AGENT_QUOTA_KB", LIMITS.agentQuotaKb) * 1024));
@@ -185,6 +202,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
       capacity: num(env, "MESH_HTTP_BURST", 240),
       refillPerSec: num(env, "MESH_HTTP_PER_MIN", 1200) / 60,
     },
+    cardRate: {
+      capacity: num(env, "MESH_CARD_BURST", 60),
+      refillPerSec: num(env, "MESH_CARD_PER_HOUR", 600) / 3600,
+    },
+    mutualRate: { capacity: mutualIdsPerDay, refillPerSec: mutualIdsPerDay / 86_400 },
+    mutualIpRate: { capacity: mutualIdsPerDayPerIp, refillPerSec: mutualIdsPerDayPerIp / 86_400 },
     writeRate: { capacity: writeBytesPerDay, refillPerSec: writeBytesPerDay / 86_400 },
     agentQuotaBytes,
     mutualTtlMs: num(env, "MESH_MUTUAL_TTL_HOURS", 24) * 3_600_000,
@@ -208,6 +231,9 @@ export function testConfig(over: Partial<MeshConfig> = {}): MeshConfig {
     agentRate: { capacity: 1000, refillPerSec: 1000 },
     ipRate: { capacity: 1000, refillPerSec: 1000 },
     httpRate: { capacity: 100_000, refillPerSec: 100_000 },
+    cardRate: { capacity: 100_000, refillPerSec: 100_000 },
+    mutualRate: { capacity: 1_000_000_000, refillPerSec: 1_000_000 },
+    mutualIpRate: { capacity: 1_000_000_000, refillPerSec: 1_000_000 },
     writeRate: { capacity: 1_000_000_000, refillPerSec: 1_000_000 },
     agentQuotaBytes: 0,
     mutualTtlMs: 24 * 3_600_000,

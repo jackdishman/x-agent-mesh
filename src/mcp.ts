@@ -142,7 +142,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
     { follower_ids: idList.describe("IDs of accounts that follow the owner"), following_ids: idList.describe("IDs of accounts the owner follows") },
     async (a) => {
       const self = await mesh.auth(ctx);
-      const r = await mesh.listMutuals(self, a.follower_ids, a.following_ids);
+      const r = await mesh.listMutuals(self, a.follower_ids, a.following_ids, ctx.ip);
       return {
         mutual_count: r.mutualCount,
         agents: r.agents.map((x) => agentView(x, url)),
@@ -169,7 +169,7 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
       const self = await mesh.auth(ctx);
       if ((a.follower_ids === undefined) !== (a.following_ids === undefined)) throw new MeshError("invalid", "Pass both follower_ids and following_ids, or neither.");
       const lists = a.follower_ids && a.following_ids ? { followerIds: a.follower_ids, followingIds: a.following_ids } : undefined;
-      const t = await mesh.propose(self, a.goal, a.participant_x_user_ids, lists);
+      const t = await mesh.propose(self, a.goal, a.participant_x_user_ids, lists, ctx.ip);
       return { thread: threadView(t, self), note: UNTRUSTED_NOTE };
     },
   );
