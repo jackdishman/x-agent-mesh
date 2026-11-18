@@ -36,6 +36,9 @@ const sameSecret = (a: string, b: string) => timingSafeEqual(createHash("sha256"
 const OPEN: ThreadStatus[] = ["active", "input_required"];
 const TERMINAL: ThreadStatus[] = ["completed", "declined", "canceled"];
 const NO_THREAD = "No such thread, or you are not a participant in it.";
+const MAX_MUTUAL_SETS = 5000;
+/** What a stored row costs besides its text: ids, timestamps, the A2A envelope. */
+const WRITE_OVERHEAD_BYTES = 512;
 
 export interface RegisterInput {
   x_user_id: string;
@@ -61,6 +64,10 @@ export class Mesh {
   private authFailLimiter: RateLimiter;
   /** The mutual set each agent last supplied (x_user_id → ids), kept for cfg.mutualTtlMs. In memory: lost on restart. */
   private mutuals = new Map<string, { ids: Set<string>; at: number }>();
+  /** The number of ids held across all of `mutuals`. */
+  private mutualIds = 0;
+  /** Bytes each agent may still store (cfg.writeRate). */
+  private writeLimiter: RateLimiter;
   /** Sign in with X: verification tickets and the OAuth flow behind /auth/x/*. */
   readonly xauth: XAuth;
 
@@ -72,7 +79,18 @@ export class Mesh {
     this.agentLimiter = new RateLimiter(cfg.agentRate, now);
     this.ipLimiter = new RateLimiter(cfg.ipRate, now);
     this.authFailLimiter = new RateLimiter({ capacity: 30, refillPerSec: 0.5 }, now);
+    this.writeLimiter = new RateLimiter(cfg.writeRate, now);
     this.xauth = new XAuth(store, cfg, now);
+  }
+
+  /**
+   * Charges `self` for a write of about `bytes` stored bytes, before anything is changed. The
+   * per-key request limit bounds how often an agent writes, not how much: this bounds the disk one
+   * key can fill.
+   */
+  private charge(self: Agent, bytes: number) {
+    const wait = this.writeLimiter.take(self.id, bytes + WRITE_OVERHEAD_BYTES);
+    if (wait > 0) throw new MeshError("rate_limited", `This agent has stored as much as it may for now. Wait ${wait} seconds before writing again; do not retry in a loop.`, wait);
   }
 
   // ---- auth and limits ----
@@ -152,21 +170,36 @@ export class Mesh {
     return a.owner_opt_in && (!this.cfg.requireVerified || a.x_verified);
   }
 
+  private forgetMutuals(xUserId: string) {
+    const m = this.mutuals.get(xUserId);
+    if (!m) return;
+    this.mutualIds -= m.ids.size;
+    this.mutuals.delete(xUserId);
+  }
+
+  /**
+   * Bounded two ways: at most MAX_MUTUAL_SETS agents, and at most LIMITS.mutualIdsTotal ids in all
+   * (a set can hold 10,000, so the entry count alone would allow gigabytes). When over, expired
+   * sets go first, then the least recently supplied. An agent whose set was dropped is simply told
+   * to call list_mutual_agents again.
+   */
   private rememberMutuals(xUserId: string, ids: Set<string>) {
     const t = this.now();
-    if (this.mutuals.size >= 5000) {
-      for (const [k, v] of this.mutuals) if (t - v.at > this.cfg.mutualTtlMs) this.mutuals.delete(k);
-      if (this.mutuals.size >= 5000) this.mutuals.delete(this.mutuals.keys().next().value as string);
+    this.forgetMutuals(xUserId);
+    const over = () => this.mutuals.size >= MAX_MUTUAL_SETS || this.mutualIds + ids.size > LIMITS.mutualIdsTotal;
+    if (over()) {
+      for (const [k, v] of this.mutuals) if (t - v.at > this.cfg.mutualTtlMs) this.forgetMutuals(k);
+      while (this.mutuals.size > 0 && over()) this.forgetMutuals(this.mutuals.keys().next().value as string);
     }
-    this.mutuals.delete(xUserId);
     this.mutuals.set(xUserId, { ids, at: t });
+    this.mutualIds += ids.size;
   }
 
   private rememberedMutuals(xUserId: string): Set<string> | null {
     const m = this.mutuals.get(xUserId);
     if (!m) return null;
     if (this.now() - m.at > this.cfg.mutualTtlMs) {
-      this.mutuals.delete(xUserId);
+      this.forgetMutuals(xUserId);
       return null;
     }
     return m.ids;
@@ -220,6 +253,8 @@ export class Mesh {
     const missing = others.filter((id) => !registered.has(id));
     if (missing.length) throw new MeshError("forbidden", `Not registered, opted-in${this.cfg.requireVerified ? ", verified" : ""} mesh agents: ${missing.join(", ")}.`);
 
+    // The goal is stored twice: on the thread and as its first message.
+    this.charge(self, 2 * Buffer.byteLength(goal));
     const thread = await this.store.insertThread({
       goal,
       proposer_x_user_id: self.x_user_id,
@@ -278,6 +313,7 @@ export class Mesh {
   }
 
   async accept(self: Agent, threadId: string, accept: boolean): Promise<Thread> {
+    this.charge(self, 0);
     const thread = await this.transition(self, threadId, (t) => {
       if (t.status !== "proposed") throw new MeshError("conflict", `This thread is ${t.status}; only a proposed thread can be accepted or declined.`);
       if (!accept) return { status: "declined" };
@@ -291,6 +327,7 @@ export class Mesh {
   async post(self: Agent, threadId: string, input: PostInput): Promise<{ thread: Thread; message: StoredMessage }> {
     if (input.needsHuman && input.setStatus) throw new MeshError("invalid", "needs_human and set_status cannot be combined.");
     if (input.data && Buffer.byteLength(JSON.stringify(input.data)) > LIMITS.dataBytes) throw new MeshError("invalid", `data is limited to ${LIMITS.dataBytes} bytes of JSON.`);
+    this.charge(self, Buffer.byteLength(input.text) + (input.data ? Buffer.byteLength(JSON.stringify(input.data)) : 0));
     const thread = await this.transition(self, threadId, (t) => {
       if (!OPEN.includes(t.status)) throw new MeshError("conflict", `This thread is ${t.status}; updates need an active or input_required thread.`);
       const next: ThreadStatus = input.needsHuman ? "input_required" : (input.setStatus ?? t.status);
@@ -321,6 +358,7 @@ export class Mesh {
     if (!payee || !t.participants.includes(payee.x_user_id) || payee.x_user_id === self.x_user_id) {
       throw new MeshError("forbidden", "Payment drafts can only name another participant of this thread as the payee.");
     }
+    this.charge(self, Buffer.byteLength(p.memo));
     const draft = {
       type: "payment_draft",
       status: "draft" as const,
