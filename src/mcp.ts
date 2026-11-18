@@ -56,7 +56,7 @@ const text = (v: unknown) => ({ content: [{ type: "text" as const, text: typeof 
 export function errorResult(e: unknown) {
   if (e instanceof MeshError) {
     return {
-      ...text({ error: e.code, message: e.message, ...(e.retryAfterSeconds ? { retry_after_seconds: e.retryAfterSeconds } : {}) }),
+      ...text({ error: e.code, message: e.message, ...(e.retryAfterSeconds ? { retry_after_seconds: e.retryAfterSeconds } : {}), ...(e.details ?? {}) }),
       isError: true,
     };
   }
@@ -203,11 +203,11 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
 
   tool(
     "list_threads",
-    "Threads you participate in, most recently updated first, optionally filtered by status.",
+    "Threads you participate in, most recently updated first, optionally filtered by status. Also returns `storage`: the bytes this agent has stored on the mesh and its quota (null = no quota).",
     { status: z.enum(STATUSES).optional() },
     async (a) => {
       const self = await mesh.auth(ctx);
-      return { threads: (await mesh.threads(self, a.status)).map((t) => threadView(t, self)), note: UNTRUSTED_NOTE };
+      return { threads: (await mesh.threads(self, a.status)).map((t) => threadView(t, self)), storage: mesh.storage(self), note: UNTRUSTED_NOTE };
     },
   );
 

@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import type { Agent, AgentPatch, NewAgent, NewMessage, NewThread, Store, StoredMessage, Thread, ThreadPatch, ThreadStatus } from "./store.js";
-import { handleTaken, StoreError, xUserIdTaken } from "./store-shared.js";
+import { handleTaken, MESSAGE_OVERHEAD_BYTES, quotaExceeded, StoreError, THREAD_OVERHEAD_BYTES, xUserIdTaken, type WriteOptions } from "./store-shared.js";
 
 const SCHEMA = `
 create table if not exists mesh_agents (
@@ -65,6 +65,10 @@ create table if not exists mesh_thread_participants (
 create index if not exists mesh_thread_participants_thread_idx on mesh_thread_participants (thread_id);
 `;
 
+/** The size of a row as store-shared.ts defines it (threadBytes / messageBytes), computed by SQLite from what it stored. */
+const THREAD_BYTES_SQL = `(octet_length(goal) + octet_length(participants) + ${THREAD_OVERHEAD_BYTES})`;
+const MESSAGE_BYTES_SQL = `(octet_length(message) + ${MESSAGE_OVERHEAD_BYTES})`;
+
 /** One agent per handle, whatever its case. Created at start-up only when the existing rows allow it. */
 const HANDLE_UNIQUE_INDEX = "mesh_agents_handle_uniq";
 
@@ -120,6 +124,69 @@ export class SqliteStore implements Store {
     this.db.exec(SCHEMA_ADDITIONS);
     this.ensureHandleIndex();
     this.backfillParticipants();
+    this.ensureUsageColumn();
+    this.usageAtStart = this.recomputeUsage();
+  }
+
+  /** What recomputeUsage found when the store was opened (for the start-up log). */
+  readonly usageAtStart: { agents: number; corrected: number; totalBytes: number; largestBytes: number };
+
+  /**
+   * Adds mesh_agents.stored_bytes to a database made by an earlier version. A plain ADD COLUMN with
+   * a default: existing rows are not rewritten, and an earlier version of the server can still use
+   * the file (it names its columns when it inserts, and ignores this one when it reads).
+   */
+  private ensureUsageColumn(): void {
+    this.tx(() => {
+      if (this.all("pragma table_info(mesh_agents)").some((c) => c.name === "stored_bytes")) return;
+      this.db.exec("alter table mesh_agents add column stored_bytes integer not null default 0");
+    });
+  }
+
+  /**
+   * Sets every agent's stored_bytes to what the tables actually hold (the formula of
+   * store-shared.ts, computed by SQLite). Run at every start: it fills the column in on a database
+   * that never had it, and corrects it if an earlier version of the server (which does not count)
+   * wrote to the file in between. One pass over threads and one over messages; only rows whose
+   * number is wrong are written. Returns what it found.
+   */
+  recomputeUsage(): { agents: number; corrected: number; totalBytes: number; largestBytes: number } {
+    const out = this.tx(() => {
+      const actual = new Map<string, number>();
+      const add = (rows: Row[]) => {
+        for (const r of rows) actual.set(String(r.u), (actual.get(String(r.u)) ?? 0) + Number(r.b));
+      };
+      add(this.all(`select proposer_x_user_id as u, sum(${THREAD_BYTES_SQL}) as b from mesh_threads group by proposer_x_user_id`));
+      add(this.all(`select from_x_user_id as u, sum(${MESSAGE_BYTES_SQL}) as b from mesh_messages group by from_x_user_id`));
+      const fix = this.db.prepare("update mesh_agents set stored_bytes = ? where x_user_id = ?");
+      let agents = 0;
+      let corrected = 0;
+      let totalBytes = 0;
+      let largestBytes = 0;
+      for (const a of this.all("select x_user_id, stored_bytes from mesh_agents")) {
+        const want = actual.get(String(a.x_user_id)) ?? 0;
+        agents++;
+        totalBytes += want;
+        largestBytes = Math.max(largestBytes, want);
+        if (Number(a.stored_bytes) === want) continue;
+        fix.run(want, String(a.x_user_id));
+        corrected++;
+      }
+      return { agents, corrected, totalBytes, largestBytes };
+    });
+    if (out.corrected > 0) console.error(`[x-agent-mesh] sqlite: recomputed stored_bytes for ${out.corrected} of ${out.agents} agents from the tables.`);
+    return out;
+  }
+
+  /** Adds the row's size (an SQL expression over the row with this id) to its author's counter, refusing first if that would pass the limit. Call inside a transaction, after the insert. */
+  private count(author: string, table: "mesh_threads" | "mesh_messages", id: string, opts?: WriteOptions): void {
+    const bytes = Number(this.must(`select ${table === "mesh_threads" ? THREAD_BYTES_SQL : MESSAGE_BYTES_SQL} as b from ${table} where id = ?`, id).b);
+    if (opts?.limitBytes !== undefined) {
+      const used = Number(this.get("select stored_bytes from mesh_agents where x_user_id = ?", author)?.stored_bytes ?? 0);
+      // Thrown inside the transaction: the row just inserted is rolled back with it.
+      if (used + bytes > opts.limitBytes) throw quotaExceeded(used, bytes, opts.limitBytes);
+    }
+    this.run(() => this.db.prepare("update mesh_agents set stored_bytes = stored_bytes + ? where x_user_id = ?").run(bytes, author));
   }
 
   /**
@@ -133,9 +200,14 @@ export class SqliteStore implements Store {
     const added = this.tx(() => {
       const r = this.db
         .prepare(
-          `insert or ignore into mesh_thread_participants (x_user_id, thread_id)
-           select j.value, t.id from mesh_threads t, json_each(t.participants) j
-           where j.type = 'text' and not exists (select 1 from mesh_thread_participants p where p.thread_id = t.id)`,
+          // The list of threads to do is fixed (materialized) before the first row goes in, so a
+          // thread's first participant row cannot make the statement skip its other participants.
+          `with todo as materialized (
+             select t.id, t.participants from mesh_threads t
+             where not exists (select 1 from mesh_thread_participants p where p.thread_id = t.id)
+           )
+           insert or ignore into mesh_thread_participants (x_user_id, thread_id)
+           select j.value, todo.id from todo, json_each(todo.participants) j where j.type = 'text'`,
         )
         .run();
       return Number(r.changes);
@@ -277,7 +349,7 @@ export class SqliteStore implements Store {
       return agent(this.must(`update mesh_agents set ${sets.join(", ")} where x_user_id = ? returning *`, ...params, xUserId))!;
     });
   }
-  async insertThread(t: NewThread) {
+  async insertThread(t: NewThread, opts?: WriteOptions) {
     return this.tx(() => {
       const at = this.stamp();
       const row = thread(
@@ -289,6 +361,7 @@ export class SqliteStore implements Store {
       )!;
       const add = this.db.prepare("insert or ignore into mesh_thread_participants (x_user_id, thread_id) values (?, ?)");
       for (const p of new Set(row.participants)) if (typeof p === "string") add.run(p, row.id);
+      this.count(row.proposer_x_user_id, "mesh_threads", row.id, opts);
       return row;
     });
   }
@@ -321,13 +394,17 @@ export class SqliteStore implements Store {
       : this.all(`select t.* ${from} order by t.updated_at desc, t.rowid desc limit 100`, xUserId);
     return rows.map((r) => thread(r)!);
   }
-  async insertMessage(m: NewMessage) {
-    return message(
-      this.must(
-        "insert into mesh_messages (id, thread_id, from_x_user_id, kind, message, needs_human, created_at) values (?, ?, ?, ?, ?, ?, ?) returning *",
-        m.id ?? randomUUID(), m.thread_id, m.from_x_user_id, m.kind, JSON.stringify(m.message), m.needs_human ? 1 : 0, this.stamp(),
-      ),
-    )!;
+  async insertMessage(m: NewMessage, opts?: WriteOptions) {
+    return this.tx(() => {
+      const row = message(
+        this.must(
+          "insert into mesh_messages (id, thread_id, from_x_user_id, kind, message, needs_human, created_at) values (?, ?, ?, ?, ?, ?, ?) returning *",
+          m.id ?? randomUUID(), m.thread_id, m.from_x_user_id, m.kind, JSON.stringify(m.message), m.needs_human ? 1 : 0, this.stamp(),
+        ),
+      )!;
+      this.count(row.from_x_user_id, "mesh_messages", row.id, opts);
+      return row;
+    });
   }
   async listMessages(threadId: string, limit: number) {
     const n = Math.max(0, Math.floor(limit));
@@ -351,6 +428,7 @@ function agent(r: Row | undefined): Agent | null {
     opted_in_at: text(r.opted_in_at),
     x_verified: Boolean(r.x_verified),
     api_key_hash: text(r.api_key_hash),
+    stored_bytes: Number(r.stored_bytes ?? 0),
     created_at: String(r.created_at),
     updated_at: String(r.updated_at),
   };

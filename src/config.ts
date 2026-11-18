@@ -37,6 +37,12 @@ export interface MeshConfig {
    * let a single key store about 1 GB a day.
    */
   writeRate: BucketConfig;
+  /**
+   * MESH_AGENT_QUOTA_KB: the most bytes one agent may ever have stored (threads it proposed plus
+   * messages it sent; Agent.stored_bytes). Unlike writeRate this is kept in the store, so it
+   * survives restarts, and it does not refill: nothing is ever deleted. 0 = no quota.
+   */
+  agentQuotaBytes: number;
   /** How long the server remembers the mutual set an agent last supplied. */
   mutualTtlMs: number;
   /**
@@ -69,6 +75,13 @@ export const LIMITS = {
   mutualIdsTotal: 200_000,
   /** The smallest per-agent write budget: one maximal message must always fit. */
   minWriteBurstBytes: 65_536,
+  /** The default per-agent storage quota (MESH_AGENT_QUOTA_KB): 10 MB, 1% of the 1 GB volume the hosted mesh runs on. */
+  agentQuotaKb: 10_240,
+  /**
+   * Bytes an agent may go over its quota for the records that answer or end a thread (accept,
+   * decline, cancel, a status change): a full agent must still be able to close what it is in.
+   */
+  quotaControlReserveBytes: 65_536,
   readDefault: 50,
   readMax: 200,
 } as const;
@@ -105,6 +118,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
   const redirectUri = (env.X_REDIRECT_URI ?? "").trim() || `${publicUrl}/auth/x/callback`;
   baseUrl("X_REDIRECT_URI", redirectUri);
   const writeBytesPerDay = Math.max(LIMITS.minWriteBurstBytes, Math.floor(num(env, "MESH_WRITE_KB_PER_DAY", 5120) * 1024));
+  // 0 turns the quota off; anything else is at least one maximal message.
+  const quotaRaw = (env.MESH_AGENT_QUOTA_KB ?? "").trim();
+  const agentQuotaBytes = /^0+(\.0+)?$/.test(quotaRaw) ? 0 : Math.max(LIMITS.minWriteBurstBytes, Math.floor(num(env, "MESH_AGENT_QUOTA_KB", LIMITS.agentQuotaKb) * 1024));
   const scopes = (env.X_OAUTH_SCOPES || "users.read tweet.read").trim().split(/\s+/).join(" ");
   if (scopes.split(" ").includes("offline.access")) {
     throw new Error("X_OAUTH_SCOPES must not include offline.access: the mesh discards X tokens and never needs a refresh token.");
@@ -125,6 +141,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MeshConfig {
       refillPerSec: num(env, "MESH_HTTP_PER_MIN", 1200) / 60,
     },
     writeRate: { capacity: writeBytesPerDay, refillPerSec: writeBytesPerDay / 86_400 },
+    agentQuotaBytes,
     mutualTtlMs: num(env, "MESH_MUTUAL_TTL_HOURS", 24) * 3_600_000,
     trustProxy: env.MESH_TRUST_PROXY === "fly" ? "fly" : env.MESH_TRUST_PROXY === "1",
     adminToken,
@@ -146,6 +163,7 @@ export function testConfig(over: Partial<MeshConfig> = {}): MeshConfig {
     ipRate: { capacity: 1000, refillPerSec: 1000 },
     httpRate: { capacity: 100_000, refillPerSec: 100_000 },
     writeRate: { capacity: 1_000_000_000, refillPerSec: 1_000_000 },
+    agentQuotaBytes: 0,
     mutualTtlMs: 24 * 3_600_000,
     trustProxy: false,
     adminToken: "",

@@ -209,7 +209,8 @@ describe("SqliteStore", () => {
 
     const b = new SqliteStore(file); // schema creation is idempotent
     expect(b.kind).toBe("sqlite");
-    expect(await b.getAgentByKeyHash("hash-1")).toEqual(agent);
+    // The agent row is as it was, plus the bytes of the thread it proposed since (test/quota.test.ts).
+    expect(await b.getAgentByKeyHash("hash-1")).toEqual({ ...agent, stored_bytes: expect.any(Number) });
     expect(await b.getThread(thread.id)).toEqual(thread);
     expect(await b.listThreadsFor("2", "active")).toEqual([thread]);
     expect(await b.listMessages(thread.id, 10)).toEqual([msg]);
