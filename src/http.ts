@@ -173,6 +173,8 @@ async function handleMcp(mesh: Mesh, ctx: CallContext, req: IncomingMessage, res
 export function createHttpServer(mesh: Mesh): Server {
   /** Every request except /healthz, per client address, before anything is parsed or looked up. */
   const limiter = new RateLimiter(mesh.cfg.httpRate, mesh.now);
+  /** Agent-card lookups by handle, per client address. */
+  const cardLimiter = new RateLimiter(mesh.cfg.cardRate, mesh.now);
   const hsts = mesh.cfg.publicUrl.startsWith("https://");
 
   const server = createServer((req, res) => {
@@ -228,6 +230,14 @@ export function createHttpServer(mesh: Mesh): Server {
           } catch {
             /* malformed escape: falls through to 404 */
           }
+          // Every lookup counts, found or not, well-formed or not: the answer says whether a handle
+          // is registered, so how many handles one address may ask about is bounded.
+          const cardWait = cardLimiter.take(ip);
+          if (cardWait > 0) {
+            return json(res, 429, { error: "rate_limited", message: `Too many agent-card lookups from this address. Wait ${cardWait} seconds before trying again; do not retry in a loop.`, retry_after_seconds: cardWait }, { "Retry-After": String(cardWait) });
+          }
+          // One answer for every reason there is no card to show: never registered, opted out,
+          // unverified on a verified-only mesh, or not a possible handle at all.
           const found = await agentCardFor(mesh, handle);
           return found ? json(res, 200, found) : json(res, 404, { error: "not_found", message: "No registered, opted-in agent with that handle." });
         }

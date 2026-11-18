@@ -72,6 +72,9 @@ export class Mesh {
   private mutualIds = 0;
   /** Bytes each agent may still store (cfg.writeRate). */
   private writeLimiter: RateLimiter;
+  /** New ids each agent (cfg.mutualRate) and each client address (cfg.mutualIpRate) may still check for agents. */
+  private mutualLimiter: RateLimiter;
+  private mutualIpLimiter: RateLimiter;
   /** Sign in with X: verification tickets and the OAuth flow behind /auth/x/*. */
   readonly xauth: XAuth;
 
@@ -84,6 +87,8 @@ export class Mesh {
     this.ipLimiter = new RateLimiter(cfg.ipRate, now);
     this.authFailLimiter = new RateLimiter({ capacity: 30, refillPerSec: 0.5 }, now);
     this.writeLimiter = new RateLimiter(cfg.writeRate, now);
+    this.mutualLimiter = new RateLimiter(cfg.mutualRate, now);
+    this.mutualIpLimiter = new RateLimiter(cfg.mutualIpRate, now);
     this.xauth = new XAuth(store, cfg, now);
   }
 
@@ -271,9 +276,32 @@ export class Mesh {
     return out;
   }
 
-  /** Intersects the two lists, remembers the mutual set for the caller, and returns the opted-in registered agents in it. */
-  async listMutuals(self: Agent, followerIds: string[], followingIds: string[]) {
+  /**
+   * A mutual list is the caller's own claim, so it doubles as a way to ask "which of these X ids
+   * have an agent here?" about anyone. This bounds that: each id not in the set the caller last
+   * supplied costs one token from the caller's budget and one from its address's. Sending the same
+   * list again is free and a real list that changed a little costs a little, while walking through
+   * lists of other people's ids runs out. Taken before anything is remembered or looked up.
+   */
+  private chargeMutuals(self: Agent, ids: Set<string>, ip: string | undefined) {
+    const previous = this.rememberedMutuals(self.x_user_id);
+    let fresh = 0;
+    for (const id of ids) if (!previous?.has(id)) fresh++;
+    if (fresh === 0) return;
+    const wait = Math.max(this.mutualLimiter.take(self.id, fresh), ip === undefined ? 0 : this.mutualIpLimiter.take(ip, fresh));
+    if (wait > 0) {
+      throw new MeshError(
+        "rate_limited",
+        `This agent has checked as many new X ids for agents as it may for now. Wait ${wait} seconds before supplying a different mutual list; the list you supplied last still works for propose_goal, and re-sending it costs nothing. Do not retry in a loop.`,
+        wait,
+      );
+    }
+  }
+
+  /** Intersects the two lists, remembers the mutual set for the caller, and returns the opted-in registered agents in it. `ip`: the caller's address, for the per-address budget. */
+  async listMutuals(self: Agent, followerIds: string[], followingIds: string[], ip?: string) {
     const ids = this.intersect(self, followerIds, followingIds);
+    this.chargeMutuals(self, ids, ip);
     this.rememberMutuals(self.x_user_id, ids);
     // On a verified-only mesh an unverified caller is shown nobody (README: it "cannot see mutuals"):
     // otherwise any invited key could look up which X ids have agents here before proving who it is.
@@ -290,7 +318,7 @@ export class Mesh {
    * be a registered, opted-in agent. The lists are the caller's own claim (the server cannot read
    * X in v0); the other side's consent is the accept step.
    */
-  async propose(self: Agent, goal: string, participantIds: string[], lists?: { followerIds: string[]; followingIds: string[] }): Promise<Thread> {
+  async propose(self: Agent, goal: string, participantIds: string[], lists?: { followerIds: string[]; followingIds: string[] }, ip?: string): Promise<Thread> {
     if (!self.owner_opt_in) throw new MeshError("forbidden", "Your owner has not opted in.");
     if (this.cfg.requireVerified && !self.x_verified) {
       throw new MeshError("forbidden", `This mesh requires X-verified agents (MESH_REQUIRE_VERIFIED=1) and yours is not verified. Call start_x_verification and have your owner open the returned verify_url to sign in with X as @${self.x_handle}.`);
@@ -302,6 +330,7 @@ export class Mesh {
     let mutualIds: Set<string> | null;
     if (lists) {
       mutualIds = this.intersect(self, lists.followerIds, lists.followingIds);
+      this.chargeMutuals(self, mutualIds, ip);
       this.rememberMutuals(self.x_user_id, mutualIds);
     } else {
       mutualIds = this.rememberedMutuals(self.x_user_id);
