@@ -425,7 +425,8 @@ describe("redirects, cookies and headers", () => {
     }
     // The callback never redirects at all, on success or failure.
     const l = await s.start(a.verifyUrl);
-    for (const params of [{ code: "c", state: "nope", redirect_uri: "https://evil.example" }, { code: "c", state: l.state, return_to: "https://evil.example", next: "//evil.example" }]) {
+    const attempts: Record<string, string>[] = [{ code: "c", state: "nope", redirect_uri: "https://evil.example" }, { code: "c", state: l.state, return_to: "https://evil.example", next: "//evil.example" }];
+    for (const params of attempts) {
       const res = await realFetch(`${s.base}/auth/x/callback?${new URLSearchParams(params)}`, { headers: { Cookie: l.cookie }, redirect: "manual" });
       expect([200, 400]).toContain(res.status);
       expect(res.headers.get("location")).toBeNull();
