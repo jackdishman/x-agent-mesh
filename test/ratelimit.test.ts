@@ -35,6 +35,24 @@ describe("RateLimiter", () => {
     expect(rl.take("b", 1)).toBeGreaterThan(0);
   });
 
+  it("peek answers what take would, without taking or remembering anything", () => {
+    let t = 0;
+    const rl = new RateLimiter({ capacity: 100, refillPerSec: 10 }, () => t);
+    expect(rl.peek("a", 60)).toBe(0);
+    expect(rl.peek("a", 60)).toBe(0); // still all there
+    expect(rl.size).toBe(0); // an unseen key is not remembered
+    expect(rl.take("a", 60)).toBe(0);
+    expect(rl.peek("a", 60)).toBe(2);
+    expect(rl.peek("a", 40)).toBe(0);
+    expect(rl.peek("a", 1000)).toBe(6); // an oversized cost is a full bucket, as in take
+    t += 2000;
+    expect(rl.peek("a", 60)).toBe(0); // refill is taken into account...
+    t -= 2000;
+    expect(rl.take("a", 60)).toBe(2); // ...but was not written back
+    expect(rl.peek("x".repeat(500))).toBe(0);
+    expect(rl.size).toBe(1);
+  });
+
   it("does not lose tokens when the clock steps backwards", () => {
     let t = 10_000;
     const rl = new RateLimiter({ capacity: 2, refillPerSec: 1 }, () => t);
