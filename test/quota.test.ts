@@ -27,6 +27,7 @@ afterEach(() => errors.mockRestore());
 const logged = (): string[] => errors.mock.calls.map((c: unknown[]) => c.map(String).join(" "));
 
 const newAgent = (id: string, handle: string): NewAgent => ({ x_user_id: id, x_handle: handle, agent_card_url: null, display_name: null, owner_opt_in: true, opted_in_at: null, api_key_hash: `hash-${id}` });
+const rawDump = (file: string) => dumpFile(file) as { agents: any[]; threads: any[]; messages: any[] };
 const used = async (s: Store, id: string) => (await s.getAgentByXUserId(id))!.stored_bytes;
 const msg = (text: string) => ({ kind: "message", role: "agent", parts: [{ kind: "text", text }] });
 
@@ -165,7 +166,10 @@ describe("SqliteStore: the counters are persistent and match the tables", () => 
 
     const b = new SqliteStore(file);
     // What was counted write by write is exactly what the tables hold: nothing to correct.
-    expect(b.usageAtStart).toEqual({ agents: 2, corrected: 0, totalBytes: before.alice + before.bob, largestBytes: before.alice });
+    // Nothing had to be read: every row was counted when it was written.
+    expect(b.usageAtStart).toEqual({ mode: "none", agents: 2, corrected: 0, totalBytes: before.alice + before.bob, largestBytes: before.alice });
+    // And a full recount from the tables agrees with the running counters, byte for byte.
+    expect(b.recomputeUsage()).toEqual({ mode: "full", agents: 2, corrected: 0, totalBytes: before.alice + before.bob, largestBytes: before.alice });
     expect({ alice: await used(b, "1"), bob: await used(b, "2") }).toEqual(before);
     expect(logged()).toEqual([]);
     // A limit given after the restart is measured against what was stored before it.
@@ -194,23 +198,85 @@ describe("SqliteStore: the counters are persistent and match the tables", () => 
     b.close();
   });
 
-  it("a counter that drifted is put right at the next start, and only that row is written", async () => {
-    const file = tmpFile();
+  /** Two agents, a thread by alice, a message by bob; returns the right numbers. */
+  async function small(file: string) {
     const a = new SqliteStore(file);
     await a.insertAgent(newAgent("1", "alice"));
     await a.insertAgent(newAgent("2", "bob"));
     const t = await a.insertThread({ goal: "g", proposer_x_user_id: "1", participants: ["1", "2"], accepted_by: ["1"], status: "proposed" });
     await a.insertMessage({ thread_id: t.id, from_x_user_id: "2", kind: "update", message: msg("hi"), needs_human: false });
-    const right = { alice: await used(a, "1"), bob: await used(a, "2") };
+    return { store: a, threadId: t.id, right: { alice: await used(a, "1"), bob: await used(a, "2") } };
+  }
+  const marks = (s: SqliteStore) => rawOf(s).prepare("select key, value from mesh_meta order by key").all().map((r) => `${String(r.key)}=${String(r.value)}`);
+
+  it("keeps two marks (the last counted rowid of each table), so a normal start reads no rows", async () => {
+    const file = tmpFile();
+    const { store, threadId } = await small(file);
+    expect(marks(store)).toEqual(["usage_counted_messages_rowid=1", "usage_counted_threads_rowid=1"]);
+    await store.insertMessage({ thread_id: threadId, from_x_user_id: "1", kind: "update", message: msg("two"), needs_human: false });
+    // A refused or failed insert moves nothing.
+    await expect(store.insertMessage({ thread_id: threadId, from_x_user_id: "1", kind: "update", message: msg("three"), needs_human: false }, { limitBytes: 1 })).rejects.toThrow();
+    await expect(store.insertMessage({ thread_id: "missing", from_x_user_id: "1", kind: "update", message: msg("x"), needs_human: false })).rejects.toThrow();
+    expect(marks(store)).toEqual(["usage_counted_messages_rowid=2", "usage_counted_threads_rowid=1"]);
+    store.close();
+    const again = new SqliteStore(file);
+    expect(again.usageAtStart.mode).toBe("none");
+    expect(marks(again)).toEqual(["usage_counted_messages_rowid=2", "usage_counted_threads_rowid=1"]);
+    again.close();
+  });
+
+  it("a counter edited by hand is put right by recomputeUsage, or by clearing mesh_meta and restarting; only wrong rows are written", async () => {
+    const file = tmpFile();
+    const { store: a, right } = await small(file);
     const bobUpdatedAt = (await a.getAgentByXUserId("2"))!.updated_at;
     rawOf(a).exec("update mesh_agents set stored_bytes = 999999 where x_user_id = '1'");
+    expect(a.recomputeUsage()).toMatchObject({ mode: "full", agents: 2, corrected: 1 });
+    expect({ alice: await used(a, "1"), bob: await used(a, "2") }).toEqual(right);
+    expect(a.recomputeUsage().corrected).toBe(0);
+
+    rawOf(a).exec("update mesh_agents set stored_bytes = 5 where x_user_id = '2'; delete from mesh_meta;");
     a.close();
     const b = new SqliteStore(file);
-    expect(b.usageAtStart).toMatchObject({ agents: 2, corrected: 1 });
+    expect(b.usageAtStart).toMatchObject({ mode: "full", agents: 2, corrected: 1 });
     expect({ alice: await used(b, "1"), bob: await used(b, "2") }).toEqual(right);
     expect((await b.getAgentByXUserId("2"))!.updated_at).toBe(bobUpdatedAt);
-    expect(logged().filter((l) => l.includes("recomputed stored_bytes for 1 of 2 agents"))).toHaveLength(1);
-    expect(b.recomputeUsage().corrected).toBe(0);
+    expect(logged().filter((l) => l.includes("recomputed stored_bytes for 1 of 2 agents from the tables"))).toHaveLength(1);
+    b.close();
+  });
+
+  it("marks that point past the end of a table (rows were removed by hand) cause a full recount", async () => {
+    const file = tmpFile();
+    const { store: a, threadId } = await small(file);
+    await a.insertMessage({ thread_id: threadId, from_x_user_id: "2", kind: "update", message: msg("x".repeat(500)), needs_human: false });
+    const withBig = await used(a, "2");
+    rawOf(a).exec("delete from mesh_messages where rowid = 2");
+    a.close();
+    const b = new SqliteStore(file);
+    expect(b.usageAtStart).toMatchObject({ mode: "full", corrected: 1 });
+    expect(await used(b, "2")).toBe(messageBytes(msg("hi")));
+    expect(await used(b, "2")).toBeLessThan(withBig);
+    b.close();
+  });
+
+  it("a row written without being counted while this version runs makes the next start recount everything, exactly", async () => {
+    const file = tmpFile();
+    const { store: a, threadId, right } = await small(file);
+    // The previous release, on the same file at the same time, inserts a message its own way.
+    const old = new DatabaseSync(file);
+    const uncounted = msg("from the old version");
+    old.prepare("insert into mesh_messages (id, thread_id, from_x_user_id, kind, message, needs_human, created_at) values ('old-1', ?, '2', 'update', ?, 0, '2026-11-18T00:00:00.000Z')").run(threadId, JSON.stringify(uncounted));
+    old.close();
+    // This version then writes on top of it: the mark cannot move past the uncounted row.
+    const mine = msg("from this version");
+    await a.insertMessage({ thread_id: threadId, from_x_user_id: "2", kind: "update", message: mine, needs_human: false });
+    expect(marks(a)).toEqual([]); // dropped: they could not be trusted any more
+    expect(await used(a, "2")).toBe(right.bob + messageBytes(mine)); // the old row is not in yet
+    a.close();
+    const b = new SqliteStore(file);
+    expect(b.usageAtStart).toMatchObject({ mode: "full", corrected: 1 });
+    expect(await used(b, "2")).toBe(right.bob + messageBytes(mine) + messageBytes(uncounted)); // each row once
+    expect(await used(b, "1")).toBe(right.alice);
+    expect(marks(b)).toEqual(["usage_counted_messages_rowid=3", "usage_counted_threads_rowid=1"]);
     b.close();
   });
 });
@@ -256,7 +322,7 @@ describe("SqliteStore: adding the counters to a database made by the previous re
     for (const [id, want] of expected) expect(await used(s, id)).toBe(want);
     expect(expected.get("2")!).toBeGreaterThan(3000);
     expect(await used(s, "3")).toBe(0);
-    expect(s.usageAtStart).toMatchObject({ agents: 3, corrected: 2 });
+    expect(s.usageAtStart).toMatchObject({ mode: "full", agents: 3, corrected: 2 });
     // Everything that was there still reads as before.
     expect(await s.getAgentByKeyHash("hash-1")).toMatchObject({ x_handle: "alice", x_verified: true, owner_opt_in: true });
     s.close();
@@ -270,7 +336,7 @@ describe("SqliteStore: adding the counters to a database made by the previous re
     errors.mockClear();
     for (let i = 0; i < 2; i++) {
       const s = new SqliteStore(file);
-      expect(s.usageAtStart.corrected).toBe(0);
+      expect(s.usageAtStart).toMatchObject({ mode: "none", corrected: 0 });
       for (const [id, want] of expected) expect(await used(s, id)).toBe(want);
       s.close();
     }
@@ -304,11 +370,17 @@ describe("SqliteStore: adding the counters to a database made by the previous re
     expect(rows.map((r) => Number(r.stored_bytes))).toEqual([expected.get("1"), expected.get("2"), 0, 0]); // the old version did not count
     old.close();
     const s = new SqliteStore(file);
-    expect(s.usageAtStart.corrected).toBe(2);
-    expect(await used(s, "1")).toBeGreaterThan(expected.get("1")!);
+    // Only the rows above the marks were read, and each was added once.
+    expect(s.usageAtStart).toMatchObject({ mode: "delta", corrected: 2, agents: 4 });
+    const oldMessage = JSON.parse(String(rawDump(file).messages.find((m: any) => String(m.message).includes("written by the old version")).message)) as Record<string, unknown>;
+    expect(await used(s, "1")).toBe(expected.get("1")! + messageBytes(oldMessage));
     expect(await used(s, "4")).toBe(threadBytes({ goal: "dave's goal", participants: ["4", "1"] }));
     expect(await used(s, "2")).toBe(expected.get("2")!);
+    expect(s.recomputeUsage().corrected).toBe(0); // a full recount agrees
     s.close();
+    const again = new SqliteStore(file);
+    expect(again.usageAtStart).toMatchObject({ mode: "none", corrected: 0 });
+    again.close();
   });
 });
 

@@ -55,6 +55,8 @@ create index if not exists mesh_messages_thread_idx on mesh_messages (thread_id,
  * mesh_thread_participants: one row per (participant, thread), so "my threads" is an index lookup
  * instead of a scan of every thread's JSON participant list. A thread's participants never change
  * after it is created, so the rows are written once, with the thread.
+ *
+ * mesh_meta: a few named values the store keeps for itself (see "stored_bytes" below).
  */
 const SCHEMA_ADDITIONS = `
 create table if not exists mesh_thread_participants (
@@ -63,7 +65,25 @@ create table if not exists mesh_thread_participants (
   primary key (x_user_id, thread_id)
 ) without rowid;
 create index if not exists mesh_thread_participants_thread_idx on mesh_thread_participants (thread_id);
+create table if not exists mesh_meta (
+  key text primary key,
+  value text not null
+) without rowid;
 `;
+
+type CountedTable = "mesh_threads" | "mesh_messages";
+/** mesh_meta keys: the highest rowid of each table whose rows are included in mesh_agents.stored_bytes. */
+const MARK: Record<CountedTable, string> = { mesh_threads: "usage_counted_threads_rowid", mesh_messages: "usage_counted_messages_rowid" };
+
+export interface UsageSummary {
+  /** What start-up had to read: nothing, only rows added since the last count, or every row. */
+  mode: "none" | "delta" | "full";
+  /** Agents whose counter was changed. */
+  corrected: number;
+  agents: number;
+  totalBytes: number;
+  largestBytes: number;
+}
 
 /** The size of a row as store-shared.ts defines it (threadBytes / messageBytes), computed by SQLite from what it stored. */
 const THREAD_BYTES_SQL = `(octet_length(goal) + octet_length(participants) + ${THREAD_OVERHEAD_BYTES})`;
@@ -124,69 +144,148 @@ export class SqliteStore implements Store {
     this.db.exec(SCHEMA_ADDITIONS);
     this.ensureHandleIndex();
     this.backfillParticipants();
-    this.ensureUsageColumn();
-    this.usageAtStart = this.recomputeUsage();
+    const columnAdded = this.ensureUsageColumn();
+    this.usageAtStart = this.syncUsage(columnAdded);
   }
 
-  /** What recomputeUsage found when the store was opened (for the start-up log). */
-  readonly usageAtStart: { agents: number; corrected: number; totalBytes: number; largestBytes: number };
+  /** What the usage counters looked like when the store was opened, and what bringing them up to date took (for the start-up log). */
+  readonly usageAtStart: UsageSummary;
 
   /**
    * Adds mesh_agents.stored_bytes to a database made by an earlier version. A plain ADD COLUMN with
    * a default: existing rows are not rewritten, and an earlier version of the server can still use
    * the file (it names its columns when it inserts, and ignores this one when it reads).
+   * Returns whether the column had to be added.
    */
-  private ensureUsageColumn(): void {
-    this.tx(() => {
-      if (this.all("pragma table_info(mesh_agents)").some((c) => c.name === "stored_bytes")) return;
+  private ensureUsageColumn(): boolean {
+    return this.tx(() => {
+      if (this.all("pragma table_info(mesh_agents)").some((c) => c.name === "stored_bytes")) return false;
       this.db.exec("alter table mesh_agents add column stored_bytes integer not null default 0");
+      return true;
+    });
+  }
+
+  // ---- stored_bytes: keeping the counters equal to the tables ----
+  //
+  // Each insert adds the row's size to its author's counter in the same transaction. What remains
+  // is rows this version did not insert: everything, on a database from an earlier version, and
+  // whatever an earlier version writes if the file is ever rolled back to it. Reading all of a
+  // large messages table at every start would cost seconds per gigabyte, so mesh_meta holds two
+  // marks: the highest rowid of mesh_threads and of mesh_messages whose rows are in the counters.
+  // Rows are never deleted and SQLite hands out rowids in increasing order, so "not counted yet"
+  // is exactly "rowid above the mark". At start: no marks → count everything; marks behind → count
+  // only the rows above them; marks at the top (the normal case) → nothing to read.
+
+  private maxRowid(table: CountedTable): number {
+    return Number(this.must(`select coalesce(max(rowid), 0) as r from ${table}`).r);
+  }
+
+  private marks(): Record<CountedTable, number> | null {
+    const rows = this.all("select key, value from mesh_meta where key in (?, ?)", MARK.mesh_threads, MARK.mesh_messages);
+    const of = (table: CountedTable): number | null => {
+      const v = rows.find((r) => r.key === MARK[table])?.value;
+      return typeof v === "string" && /^\d{1,15}$/.test(v) ? Number(v) : null;
+    };
+    const threads = of("mesh_threads");
+    const messages = of("mesh_messages");
+    return threads === null || messages === null ? null : { mesh_threads: threads, mesh_messages: messages };
+  }
+
+  private setMarks(at: Record<CountedTable, number>): void {
+    const put = this.db.prepare("insert into mesh_meta (key, value) values (?, ?) on conflict (key) do update set value = excluded.value");
+    for (const table of ["mesh_threads", "mesh_messages"] as const) this.run(() => put.run(MARK[table], String(at[table])));
+  }
+
+  /** Bytes per author over the rows above the given rowids (0, 0 = every row). */
+  private bytesByAuthor(above: Record<CountedTable, number>): Map<string, number> {
+    const out = new Map<string, number>();
+    const add = (rows: Row[]) => {
+      for (const r of rows) out.set(String(r.u), (out.get(String(r.u)) ?? 0) + Number(r.b));
+    };
+    add(this.all(`select proposer_x_user_id as u, sum(${THREAD_BYTES_SQL}) as b from mesh_threads where rowid > ? group by proposer_x_user_id`, above.mesh_threads));
+    add(this.all(`select from_x_user_id as u, sum(${MESSAGE_BYTES_SQL}) as b from mesh_messages where rowid > ? group by from_x_user_id`, above.mesh_messages));
+    return out;
+  }
+
+  /** Sets every counter to what the tables hold. Only rows whose number is wrong are written. Returns how many were. Inside a transaction. */
+  private recount(): number {
+    const actual = this.bytesByAuthor({ mesh_threads: 0, mesh_messages: 0 });
+    const fix = this.db.prepare("update mesh_agents set stored_bytes = ? where x_user_id = ?");
+    let corrected = 0;
+    for (const a of this.all("select x_user_id, stored_bytes from mesh_agents")) {
+      const want = actual.get(String(a.x_user_id)) ?? 0;
+      if (Number(a.stored_bytes) === want) continue;
+      this.run(() => fix.run(want, String(a.x_user_id)));
+      corrected++;
+    }
+    return corrected;
+  }
+
+  private summary(mode: UsageSummary["mode"], corrected: number): UsageSummary {
+    const r = this.must("select count(*) as n, coalesce(sum(stored_bytes), 0) as total, coalesce(max(stored_bytes), 0) as largest from mesh_agents");
+    return { mode, corrected, agents: Number(r.n), totalBytes: Number(r.total), largestBytes: Number(r.largest) };
+  }
+
+  /** Brings the counters up to date at start-up, reading as little as the marks allow (see above). */
+  private syncUsage(forceFull: boolean): UsageSummary {
+    const out = this.tx(() => {
+      const marks = forceFull ? null : this.marks();
+      const top = { mesh_threads: this.maxRowid("mesh_threads"), mesh_messages: this.maxRowid("mesh_messages") };
+      let mode: UsageSummary["mode"] = "none";
+      let corrected = 0;
+      if (!marks || marks.mesh_threads > top.mesh_threads || marks.mesh_messages > top.mesh_messages) {
+        // Never counted, or rows the marks speak of are gone (someone edited the file): start over.
+        mode = "full";
+        corrected = this.recount();
+      } else if (marks.mesh_threads < top.mesh_threads || marks.mesh_messages < top.mesh_messages) {
+        mode = "delta";
+        const add = this.db.prepare("update mesh_agents set stored_bytes = stored_bytes + ? where x_user_id = ?");
+        for (const [author, bytes] of this.bytesByAuthor(marks)) corrected += Number(this.run(() => add.run(bytes, author)).changes);
+      }
+      this.setMarks(top);
+      return this.summary(mode, corrected);
+    });
+    if (out.corrected > 0) {
+      console.error(`[x-agent-mesh] sqlite: recomputed stored_bytes for ${out.corrected} of ${out.agents} agents from ${out.mode === "full" ? "the tables" : "the rows added since the last count"}.`);
+    }
+    return out;
+  }
+
+  /**
+   * Sets every agent's stored_bytes to what the tables actually hold, reading all of them: for an
+   * operator who edited the database by hand (deleting rows does not move the marks, so start-up
+   * would not notice). Deleting the rows of mesh_meta and restarting does the same.
+   */
+  recomputeUsage(): UsageSummary {
+    return this.tx(() => {
+      const corrected = this.recount();
+      this.setMarks({ mesh_threads: this.maxRowid("mesh_threads"), mesh_messages: this.maxRowid("mesh_messages") });
+      return this.summary("full", corrected);
     });
   }
 
   /**
-   * Sets every agent's stored_bytes to what the tables actually hold (the formula of
-   * store-shared.ts, computed by SQLite). Run at every start: it fills the column in on a database
-   * that never had it, and corrects it if an earlier version of the server (which does not count)
-   * wrote to the file in between. One pass over threads and one over messages; only rows whose
-   * number is wrong are written. Returns what it found.
+   * Adds the size of the row just inserted (computed by SQLite from what it stored) to its
+   * author's counter, refusing first if that would pass the limit, and moves the table's mark up
+   * to the row. Call inside the insert's transaction.
    */
-  recomputeUsage(): { agents: number; corrected: number; totalBytes: number; largestBytes: number } {
-    const out = this.tx(() => {
-      const actual = new Map<string, number>();
-      const add = (rows: Row[]) => {
-        for (const r of rows) actual.set(String(r.u), (actual.get(String(r.u)) ?? 0) + Number(r.b));
-      };
-      add(this.all(`select proposer_x_user_id as u, sum(${THREAD_BYTES_SQL}) as b from mesh_threads group by proposer_x_user_id`));
-      add(this.all(`select from_x_user_id as u, sum(${MESSAGE_BYTES_SQL}) as b from mesh_messages group by from_x_user_id`));
-      const fix = this.db.prepare("update mesh_agents set stored_bytes = ? where x_user_id = ?");
-      let agents = 0;
-      let corrected = 0;
-      let totalBytes = 0;
-      let largestBytes = 0;
-      for (const a of this.all("select x_user_id, stored_bytes from mesh_agents")) {
-        const want = actual.get(String(a.x_user_id)) ?? 0;
-        agents++;
-        totalBytes += want;
-        largestBytes = Math.max(largestBytes, want);
-        if (Number(a.stored_bytes) === want) continue;
-        fix.run(want, String(a.x_user_id));
-        corrected++;
-      }
-      return { agents, corrected, totalBytes, largestBytes };
-    });
-    if (out.corrected > 0) console.error(`[x-agent-mesh] sqlite: recomputed stored_bytes for ${out.corrected} of ${out.agents} agents from the tables.`);
-    return out;
-  }
-
-  /** Adds the row's size (an SQL expression over the row with this id) to its author's counter, refusing first if that would pass the limit. Call inside a transaction, after the insert. */
-  private count(author: string, table: "mesh_threads" | "mesh_messages", id: string, opts?: WriteOptions): void {
-    const bytes = Number(this.must(`select ${table === "mesh_threads" ? THREAD_BYTES_SQL : MESSAGE_BYTES_SQL} as b from ${table} where id = ?`, id).b);
+  private count(author: string, table: CountedTable, id: string, opts?: WriteOptions): void {
+    const row = this.must(`select rowid as r, ${table === "mesh_threads" ? THREAD_BYTES_SQL : MESSAGE_BYTES_SQL} as b from ${table} where id = ?`, id);
+    const rowid = Number(row.r);
+    const bytes = Number(row.b);
     if (opts?.limitBytes !== undefined) {
       const used = Number(this.get("select stored_bytes from mesh_agents where x_user_id = ?", author)?.stored_bytes ?? 0);
       // Thrown inside the transaction: the row just inserted is rolled back with it.
       if (used + bytes > opts.limitBytes) throw quotaExceeded(used, bytes, opts.limitBytes);
     }
     this.run(() => this.db.prepare("update mesh_agents set stored_bytes = stored_bytes + ? where x_user_id = ?").run(bytes, author));
+    // The mark moves only from the row directly below this one: then every row up to here is
+    // counted. If it is anywhere else, some row in between was written without being counted (an
+    // earlier version of the server using the file at the same time): the marks can no longer be
+    // trusted, so they are dropped and the next start counts everything again.
+    const below = Number(this.get(`select rowid as r from ${table} where rowid < ? order by rowid desc limit 1`, rowid)?.r ?? 0);
+    const moved = this.run(() => this.db.prepare("update mesh_meta set value = ? where key = ? and value = ?").run(String(rowid), MARK[table], String(below)));
+    if (Number(moved.changes) === 0) this.run(() => this.db.prepare("delete from mesh_meta where key in (?, ?)").run(MARK.mesh_threads, MARK.mesh_messages));
   }
 
   /**
