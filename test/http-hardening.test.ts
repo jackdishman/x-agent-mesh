@@ -285,8 +285,9 @@ describe("malformed requests and methods", () => {
     }
     // No CORS: a browser page on another origin cannot read anything or send a bearer key.
     const preflight = await fetch(`${base}/mcp`, { method: "OPTIONS", headers: { Origin: "https://evil.example", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization" } });
-    expect(preflight.status).toBe(405);
+    expect(preflight.status).toBe(403); // refused for its Origin before the method is looked at (test/origin.test.ts)
     expect(preflight.headers.get("access-control-allow-origin")).toBeNull();
+    expect((await fetch(`${base}/mcp`, { method: "OPTIONS" })).status).toBe(405); // without an Origin: the method answer, as before
     expect((await fetch(`${base}/healthz`, { headers: { Origin: "https://evil.example" } })).headers.get("access-control-allow-origin")).toBeNull();
   });
 
