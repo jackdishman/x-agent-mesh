@@ -43,7 +43,7 @@ export interface FakeX {
   me: unknown;
   calls: XCall[];
   /** When set, replaces the whole answer for one endpoint. */
-  respond?: (url: string) => Response | Promise<Response> | undefined;
+  respond?: (url: string) => Response | undefined | Promise<Response | undefined>;
 }
 
 /**
