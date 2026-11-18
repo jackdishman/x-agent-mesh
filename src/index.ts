@@ -15,6 +15,7 @@ server.listen(port, host, () => {
   console.error(`[x-agent-mesh] listening on http://${host}:${port} (public URL ${cfg.publicUrl})`);
   console.error(`[x-agent-mesh] MCP: POST /mcp · A2A: POST /a2a · card: GET /.well-known/agent-card.json · health: GET /healthz`);
   console.error(`[x-agent-mesh] registration: ${cfg.adminToken ? "invite-only (MESH_ADMIN_TOKEN is set)" : "OPEN (no MESH_ADMIN_TOKEN): do not expose this server publicly"}`);
+  console.error(`[x-agent-mesh] browser origins allowed on /mcp and /a2a: ${cfg.allowedOrigins === "*" ? "ANY (MESH_ALLOWED_ORIGINS=*: the Origin check is off)" : cfg.allowedOrigins.join(", ")}; requests without an Origin header are always accepted`);
   console.error(`[x-agent-mesh] storage quota: ${cfg.agentQuotaBytes > 0 ? `${Math.round(cfg.agentQuotaBytes / 1024)} KB per agent (MESH_AGENT_QUOTA_KB)` : "none (MESH_AGENT_QUOTA_KB=0)"}`);
   console.error(`[x-agent-mesh] X OAuth: ${xOAuthConfigured(cfg) ? `configured (callback ${cfg.xOAuth.redirectUri})` : "DISABLED (X_CLIENT_ID / X_CLIENT_SECRET not set): agents cannot be verified"}${cfg.requireVerified ? "; MESH_REQUIRE_VERIFIED=1, so unverified agents are hidden and cannot propose" : ""}`);
 });

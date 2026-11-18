@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP } from "node:net";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { agentCardFor, handleA2A, meshAgentCard, RPC } from "./a2a.js";
-import { LIMITS, xOAuthConfigured } from "./config.js";
+import { LIMITS, normalizeOrigin, xOAuthConfigured } from "./config.js";
 import { buildMcpServer, VERSION } from "./mcp.js";
 import type { CallContext, Mesh } from "./mesh.js";
 import { RateLimiter } from "./ratelimit.js";
@@ -123,6 +123,21 @@ function context(req: IncomingMessage, ip: string): CallContext {
   return { apiKey: m?.[1], ip, adminToken: typeof admin === "string" && admin ? admin : undefined };
 }
 
+/**
+ * DNS-rebinding protection for the two agent endpoints (the MCP spec asks servers to validate
+ * `Origin`). Browsers attach `Origin` to every cross-origin POST, and a page cannot remove or forge
+ * it, so a page on another site (or one that re-pointed its own host name at this server) is
+ * refused here whatever key it holds. Agent clients are not browsers and send no `Origin`: a
+ * request without the header is always let through.
+ */
+export function originAllowed(allowed: string[] | "*", header: string | string[] | undefined): boolean {
+  if (header === undefined) return true;
+  if (allowed === "*") return true;
+  if (typeof header !== "string") return false;
+  const origin = normalizeOrigin(header);
+  return origin !== null && allowed.includes(origin);
+}
+
 /** True unless the request names a media type that is not JSON (a missing Content-Type is let through). */
 function jsonContentType(req: IncomingMessage): boolean {
   const raw = req.headers["content-type"];
@@ -183,6 +198,16 @@ export function createHttpServer(mesh: Mesh): Server {
           const message = `Too many requests from this address. Wait ${wait} seconds before trying again; do not retry in a loop.`;
           if (path === "/mcp" || path === "/a2a") return json(res, 429, rpcError(RPC.rateLimited, "Rate limit exceeded", { retry_after_seconds: wait, detail: message }), headers);
           return json(res, 429, { error: "rate_limited", message, retry_after_seconds: wait }, headers);
+        }
+
+        if ((path === "/mcp" || path === "/a2a") && !originAllowed(mesh.cfg.allowedOrigins, req.headers.origin)) {
+          // Before the body is read, the key is looked at or anything is run. The body is not read: close.
+          return json(
+            res,
+            403,
+            rpcError(RPC.forbidden, "Origin not allowed", "This endpoint does not accept requests from this web origin. Agent clients should send no Origin header; a browser app must be listed in the server's MESH_ALLOWED_ORIGINS."),
+            { Connection: "close" },
+          );
         }
 
         if (path === "/auth/x/login" || path === "/auth/x/callback") {
