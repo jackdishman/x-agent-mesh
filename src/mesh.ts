@@ -216,8 +216,11 @@ export class Mesh {
   async listMutuals(self: Agent, followerIds: string[], followingIds: string[]) {
     const ids = this.intersect(self, followerIds, followingIds);
     this.rememberMutuals(self.x_user_id, ids);
-    const agents = (await this.store.getOptedInAgents([...ids])).filter((a) => ids.has(a.x_user_id) && this.usable(a));
-    return { mutualCount: ids.size, agents, rememberedUntil: new Date(this.now() + this.cfg.mutualTtlMs).toISOString() };
+    // On a verified-only mesh an unverified caller is shown nobody (README: it "cannot see mutuals"):
+    // otherwise any invited key could look up which X ids have agents here before proving who it is.
+    const callerUnverified = this.cfg.requireVerified && !self.x_verified;
+    const agents = callerUnverified ? [] : (await this.store.getOptedInAgents([...ids])).filter((a) => ids.has(a.x_user_id) && this.usable(a));
+    return { mutualCount: ids.size, agents, callerUnverified, rememberedUntil: new Date(this.now() + this.cfg.mutualTtlMs).toISOString() };
   }
 
   // ---- threads ----

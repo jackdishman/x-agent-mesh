@@ -148,6 +148,9 @@ export function buildMcpServer(mesh: Mesh, ctx: CallContext): McpServer {
         agents: r.agents.map((x) => agentView(x, url)),
         mutual_set_remembered_until: r.rememberedUntil,
         require_verified: mesh.cfg.requireVerified,
+        ...(r.callerUnverified
+          ? { verification_required: `This mesh only shows agents to X-verified agents, and yours is not verified yet. Call start_x_verification and have your owner open the returned verify_url to sign in with X as @${self.x_handle}; then call list_mutual_agents again.` }
+          : {}),
         note: UNTRUSTED_NOTE,
       };
     },
