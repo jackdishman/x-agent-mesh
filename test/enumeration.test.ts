@@ -169,6 +169,29 @@ describe("mutual lists: budget of new ids per agent", () => {
     expect((await call(mesh, as(c, "198.51.100.8"), "list_mutual_agents", lists(ids(30_000, 5000)))).isError).toBe(false);
   });
 
+  it("a refused call charges neither budget: an agent over its own cannot drain its address's for others", async () => {
+    const mesh = newMesh({ mutualRate: perDay(10_000), mutualIpRate: perDay(30_000) });
+    const a = await register(mesh, "1", "alice");
+    const b = await register(mesh, "2", "bob");
+    const shared = "198.51.100.9";
+    const as = (who: typeof a) => ({ ...who.ctx, ip: shared });
+    expect((await call(mesh, as(a), "list_mutual_agents", lists(ids(10_000, 9000)))).isError).toBe(false);
+    // Alice is now over her own budget and keeps trying with fresh ids.
+    for (let i = 0; i < 20; i++) expect((await call(mesh, as(a), "list_mutual_agents", lists(ids(100_000 + i * 5000, 5000)))).body.error).toBe("rate_limited");
+    // The address has spent 9,000 of 30,000, not 109,000: bob's two full lists still fit.
+    expect((await call(mesh, as(b), "list_mutual_agents", lists(ids(500_000, 10_000)))).isError).toBe(false);
+    expect((await call(mesh, { ...b.ctx, ip: shared }, "list_mutual_agents", lists(ids(600_000, 10_000)))).body.error).toBe("rate_limited"); // bob's own budget, as it should be
+    // And the other way round: refused for the address, the agent's own budget is not charged.
+    const c = await register(mesh, "3", "carol");
+    const tight = newMesh({ mutualRate: perDay(10_000), mutualIpRate: perDay(10_000) });
+    const d = await register(tight, "1", "dave");
+    const e = await register(tight, "2", "erin");
+    expect((await call(tight, { ...d.ctx, ip: shared }, "list_mutual_agents", lists(ids(1000, 8000)))).isError).toBe(false);
+    for (let i = 0; i < 5; i++) expect((await call(tight, { ...e.ctx, ip: shared }, "list_mutual_agents", lists(ids(50_000, 5000)))).body.error).toBe("rate_limited");
+    expect((await call(tight, { ...e.ctx, ip: "198.51.100.10" }, "list_mutual_agents", lists(ids(50_000, 10_000)))).isError).toBe(false); // erin's whole budget was intact
+    expect(c.id).toBe("3");
+  });
+
   it("a full 10,000-id list always fits a fresh budget, whatever the configured numbers", async () => {
     const cfg = loadConfig({ MESH_MUTUAL_IDS_PER_DAY: "1", MESH_MUTUAL_IDS_PER_DAY_PER_IP: "1" });
     expect(cfg.mutualRate.capacity).toBe(LIMITS.ids);

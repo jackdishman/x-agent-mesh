@@ -325,7 +325,8 @@ export class SqliteStore implements Store {
       this.tx(() => {
         const dups = this.all("select lower(x_handle) as handle, count(*) as n from mesh_agents group by lower(x_handle) having count(*) > 1 order by 1 limit 5");
         if (dups.length > 0) {
-          const shown = dups.map((d) => `@${String(d.handle)} (${String(d.n)} agents)`).join(", ");
+          // Handles are validated when registered, but this is whatever the file holds: keep the log line clean.
+          const shown = dups.map((d) => `@${String(d.handle).replace(/[^a-z0-9_]/g, "?").slice(0, 30)} (${Number(d.n)} agents)`).join(", ");
           console.error(
             `[x-agent-mesh] WARNING: handles registered more than once: ${shown}${dups.length === 5 ? ", ..." : ""}. The unique index ${HANDLE_UNIQUE_INDEX} was NOT created and no row was changed. New duplicates are still refused. Resolve these by hand, then restart.`,
           );

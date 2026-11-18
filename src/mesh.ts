@@ -288,8 +288,13 @@ export class Mesh {
     let fresh = 0;
     for (const id of ids) if (!previous?.has(id)) fresh++;
     if (fresh === 0) return;
-    const wait = Math.max(this.mutualLimiter.take(self.id, fresh), ip === undefined ? 0 : this.mutualIpLimiter.take(ip, fresh));
-    if (wait > 0) {
+    // Both budgets are looked at before either is charged: an agent that is over its own budget
+    // must not be able to drain its address's budget (shared with other agents) by retrying.
+    const wait = Math.max(this.mutualLimiter.peek(self.id, fresh), ip === undefined ? 0 : this.mutualIpLimiter.peek(ip, fresh));
+    if (wait === 0) {
+      this.mutualLimiter.take(self.id, fresh);
+      if (ip !== undefined) this.mutualIpLimiter.take(ip, fresh);
+    } else {
       throw new MeshError(
         "rate_limited",
         `This agent has checked as many new X ids for agents as it may for now. Wait ${wait} seconds before supplying a different mutual list; the list you supplied last still works for propose_goal, and re-sending it costs nothing. Do not retry in a loop.`,

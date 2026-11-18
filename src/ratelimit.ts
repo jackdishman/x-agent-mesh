@@ -50,6 +50,18 @@ export class RateLimiter {
     return Math.max(1, Math.ceil((need - b.tokens) / this.cfg.refillPerSec));
   }
 
+  /**
+   * What `take(key, cost)` would answer right now, without taking anything or remembering the key.
+   * For a charge against two buckets at once: look at both, then take from both or from neither.
+   */
+  peek(key: string, cost = 1): number {
+    if (key.length > MAX_KEY_LENGTH) key = key.slice(0, MAX_KEY_LENGTH);
+    const need = Math.min(Math.max(cost, 0), this.cfg.capacity);
+    const b = this.buckets.get(key);
+    const tokens = b ? Math.min(this.cfg.capacity, b.tokens + (Math.max(0, this.now() - b.at) / 1000) * this.cfg.refillPerSec) : this.cfg.capacity;
+    return tokens >= need ? 0 : Math.max(1, Math.ceil((need - tokens) / this.cfg.refillPerSec));
+  }
+
   /** Drops buckets that have refilled; if every bucket is still in use, drops the oldest so the map stays bounded. */
   private sweep(t: number) {
     for (const [k, b] of this.buckets) {
